@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Dict, Optional, Tuple
 
 import controller
+from daily_planner import DailyPlanner
 
 
 DEFAULT_API_URL = "https://api.typesafe.ai/v1/systemone"
@@ -30,6 +31,12 @@ SAFE_COLLECT_PREFABS = {
     "log": "Loose log; needed for campfires and early structures.",
     "rocks": "Loose rocks; needed for early tools and structures.",
     "goldnugget": "Loose gold; useful for early tools and structures.",
+    "nitre": "Loose nitre from mined rocks; useful for later crafting.",
+    "pinecone": "Loose pine cone from a felled tree; can be replanted.",
+    "acorn": "Loose birchnut from a felled tree; can be replanted.",
+    "charcoal": "Loose charcoal from a burnt tree; useful for crafting.",
+    "marble": "Loose marble from mining; useful for later crafting.",
+    "moonrocknugget": "Loose moon rock from mining.",
     "berries": "Food that can reduce early hunger risk.",
     "berrybush": "Berry source if it currently offers a pick action.",
     "berrybush2": "Berry source if it currently offers a pick action.",
@@ -39,6 +46,8 @@ SAFE_COLLECT_PREFABS = {
     "seeds": "Low-priority emergency food.",
 }
 SAFE_FOOD_PREFABS = {
+    "cookedmeat",
+    "cookedsmallmeat",
     "berries_cooked",
     "carrot_cooked",
     "berries",
@@ -46,6 +55,13 @@ SAFE_FOOD_PREFABS = {
     "seeds_cooked",
     "seeds",
 }
+COOKABLE_FOOD_PRODUCTS = {
+    "meat": "cookedmeat",
+    "smallmeat": "cookedsmallmeat",
+    "berries": "berries_cooked",
+    "carrot": "carrot_cooked",
+}
+CRITICAL_HUNGER_RATIO = 0.30
 TOOL_MAX_USES = {"axe": 100, "pickaxe": 33}
 PICKABLE_SOURCE_PREFABS = {
     "grass",
@@ -135,34 +151,17 @@ def has_nearby_lit_fire(state: dict, maximum_distance: float = 8.0) -> bool:
     )
 
 
-def first_day_survival_knowledge(state: dict) -> list[str]:
-    """Return textual game knowledge plus live first-night preparation progress."""
-    if state.get("world", {}).get("day") != 1:
-        return []
-
-    counts = inventory_counts(state)
-    twigs = counts.get("twigs", 0)
-    cutgrass = counts.get("cutgrass", 0)
-    torches = counts.get("torch", 0)
-    missing_twigs = max(0, 2 - twigs)
-    missing_grass = max(0, 2 - cutgrass)
-    phase = state.get("world", {}).get("phase", "unknown")
-    light_ready = torches > 0 or has_nearby_lit_fire(state)
-    return [
-        "On the first night, darkness attacks and damages an unprotected character; an active light source is required.",
-        "One torch costs exactly 2 twigs and 2 cut grass, so gather at least those materials before night.",
-	    "Pick up berries, carrots, or seeds to reduce hunger risk; they are optional but useful for early survival.",
-        "Grass tufts provide cut grass; saplings and loose twigs provide twigs.",
-        "Dusk is the final warning before night. If first-night light is not ready, prioritize missing torch materials and crafting over optional resources.",
-        "A crafted torch can be kept unequipped during day and dusk to save durability, then equipped at night when no lit campfire or firepit is nearby.",
-        "A campfire is stationary light and costs 2 logs plus 3 cut grass; it is an alternative only when its recipe is available and a suitable site can be reached safely.",
+def nearest_cookable_fire(state: dict, maximum_distance: float = 6.0) -> Optional[dict]:
+    return min(
         (
-            f"Current first-night preparation state: phase={phase}; twigs={twigs}/2; "
-            f"cut_grass={cutgrass}/2; torches={torches}; missing_twigs={missing_twigs}; "
-            f"missing_cut_grass={missing_grass}; can_craft_torch="
-            f"{bool(state.get('crafting', {}).get('torch', False))}; light_ready={light_ready}."
+            entity for entity in state.get("nearby", [])
+            if entity.get("prefab") in {"campfire", "firepit"}
+            and {"fire", "cooker"}.issubset(set(entity.get("tags", [])))
+            and float(entity.get("distance", 999)) <= maximum_distance
         ),
-    ]
+        key=lambda entity: float(entity.get("distance", 999)),
+        default=None,
+    )
 
 
 def conservative_tool_uses(state: dict, prefab: str) -> int:
@@ -190,21 +189,22 @@ def has_immediate_threat(state: dict, threshold: float = 5.0) -> bool:
         for entity in state.get("nearby", [])
     )
 
+
+def can_eat_safe_food(state: dict) -> bool:
+    counts = inventory_counts(state)
+    if any(counts.get(prefab, 0) > 0 for prefab in SAFE_FOOD_PREFABS):
+        return True
+    return nearest_cookable_fire(state) is not None and any(
+        counts.get(prefab, 0) > 0 for prefab in COOKABLE_FOOD_PRODUCTS
+    )
+
+
 def action_allowed(state: dict, action_kind: str) -> tuple[bool, str]:
     """Return (allowed, reason_if_blocked). Filter actions that are meaningless or unsafe."""
     phase = state.get("world", {}).get("phase")
     torch_equipped = has_equipped_torch(state)
     nearby_lit_fire = has_nearby_lit_fire(state)
     immediate_threat = has_immediate_threat(state)
-    vitals = state.get("player", {}).get("vitals", {})
-    hunger = float(vitals.get("hunger") or 1)
-    hunger_max = max(float(vitals.get("hunger_max") or 1), 1)
-
-    if hunger / hunger_max < 0.20 and action_kind not in {
-        "eat_safe_food", "wait", "collect", "flee_from_nearest_hostile"
-    }:
-        return False, "hunger is below 20%: only eat or wait are allowed"
-
     if immediate_threat:
         allowed = {
             "flee_from_nearest_hostile",
@@ -214,24 +214,46 @@ def action_allowed(state: dict, action_kind: str) -> tuple[bool, str]:
         if action_kind not in allowed:
             return False, "immediate threat: only flee, equip weapon, or attack are allowed"
 
+    vitals = state.get("player", {}).get("vitals", {})
+    hunger = float(vitals.get("hunger") or 0)
+    hunger_max = max(float(vitals.get("hunger_max") or 1), 1)
+    if (
+        not immediate_threat
+        and hunger / hunger_max < CRITICAL_HUNGER_RATIO
+        and can_eat_safe_food(state)
+    ):
+        # Eating dominates optional actions, but escape and immediate light remain available.
+        emergency_actions = {"eat_safe_food", "flee_from_nearest_hostile"}
+        if phase == "night" and not torch_equipped and not nearby_lit_fire:
+            emergency_actions.update({"equip_torch", "craft_torch", "build_campfire"})
+        if action_kind not in emergency_actions:
+            return False, "critical hunger: eat carried food before optional actions"
+
     # night policy: no chopping or mining
-    if phase == "night" and action_kind in {"chop_nearest_tree", "mine_nearest_rock","equip_weapon","attack_nearest_hostile"}:
-        return False, "chopping or mining is forbidden at night"
+    if phase == "night" and action_kind in {
+        "chop_nearest_tree", "mine_nearest_rock", "equip_weapon", "attack_nearest_hostile"
+    }:
+        return False, "chopping, mining, equipping weapons, and attacking are forbidden at night"
+
+    # A stationary campfire is not portable light for travel to a target.
+    if phase == "night" and action_kind in {"explore", "collect"} and not torch_equipped:
+        return False, "exploration or collection at night requires an equipped torch, even beside a lit fire"
 
     # night no torch: no movement or collection
-    if phase == "night" and not torch_equipped:
+    if phase == "night" and not torch_equipped and not nearby_lit_fire:
         allowed = {
             "wait",
             "craft_torch",
             "equip_torch",
             "build_campfire",
             "flee_from_nearest_hostile",
+            "eat_safe_food",
         }
         if action_kind not in allowed:
-            return False, "movement or collection b:locked at night without an equipped torch"
+            return False, "movement or collection blocked at night without light"
 
     # day/dusk or nearby fire: no torch equip
-    if action_kind in {"equip_torch","build_campfire"} and (phase != "night" or nearby_lit_fire):
+    if action_kind in {"equip_torch", "build_campfire"} and (phase != "night" or nearby_lit_fire):
         return False, "torch should not be equipped in daylight or beside a lit fire"
 
     # night equip torch: no unequip torch
@@ -263,9 +285,14 @@ def build_candidates(state: dict) -> Tuple[Dict[str, str], Dict[str, dict]]:
     for prefab, entity in sorted(nearest_by_prefab.items()):
         action_id = f"collect_{prefab}"
         distance = float(entity.get("distance", 0))
+        leftover_note = (
+            " Chopping or mining already picks up nearby matching drops; use this for leftovers."
+            if prefab in {"log", "rocks"} else ""
+        )
         criteria[action_id] = (
             f"Approach and collect the nearest observed {prefab}, {distance:.2f} world units away. "
             f"{SAFE_COLLECT_PREFABS[prefab]} Choose only when its benefit exceeds exploration risk."
+            f"{leftover_note}"
         )
         dispatch[action_id] = {
             "kind": "collect",
@@ -274,24 +301,48 @@ def build_candidates(state: dict) -> Tuple[Dict[str, str], Dict[str, dict]]:
         }
 
     navigation = state.get("navigation", {})
+    biome = navigation.get("current_biome") or "unidentified terrain"
+    topology = navigation.get("current_region") or "unknown"
     frontier_target = navigation.get("target")
     frontier_leg = navigation.get("leg")
     if navigation.get("status") == "ready" and frontier_target and frontier_leg:
-        criteria["explore"] = (
-            f"Continue frontier exploration toward the persistent target at "
+        criteria["explore_current_region"] = (
+            f"Survey the unexplored edge of the current terrain biome ({biome}); already here. "
+            f"The local frontier target is at "
             f"({float(frontier_target.get('x', 0)):.2f}, {float(frontier_target.get('z', 0)):.2f}), "
             f"{float(frontier_target.get('distance', 0)):.2f} units away. Walk only the next "
             f"{float(frontier_leg.get('distance', 0)):.2f}-unit leg, then stop and reconsider all actions. "
-            f"The frontier has information gain {frontier_target.get('information_gain')} and score "
-            f"{frontier_target.get('score')}."
+            f"This explores the present terrain type rather than following a road outward."
         )
-        dispatch["explore"] = {
+        dispatch["explore_current_region"] = {
             "kind": "explore",
+            "navigation_mode": "region",
             "target_x": frontier_leg.get("x"),
             "target_z": frontier_leg.get("z"),
             "leg_distance": frontier_leg.get("distance"),
             "frontier_x": frontier_target.get("x"),
             "frontier_z": frontier_target.get("z"),
+        }
+    road = navigation.get("road") or {}
+    road_target = road.get("target") or {}
+    road_leg = road.get("leg") or {}
+    if road.get("status") == "ready" and road_target and road_leg:
+        criteria["explore_other_region"] = (
+            f"Follow an observed road from {biome} terrain (topology {topology}) to look for another biome. "
+            f"The next road waypoint is {float(road_target.get('distance', 0)):.2f} units away; "
+            f"begin with its {float(road_leg.get('distance', 0)):.2f}-unit leg, then follow live "
+            "road waypoints for at most 10 units before reconsidering all actions. Stop sooner "
+            "for a new terrain biome, a close new resource, a threat, a phase change, or darkness. "
+            "A road may end without finding a new biome."
+        )
+        dispatch["explore_other_region"] = {
+            "kind": "explore",
+            "navigation_mode": "road",
+            "target_x": road_leg.get("x"),
+            "target_z": road_leg.get("z"),
+            "leg_distance": road_leg.get("distance"),
+            "frontier_x": road_target.get("x"),
+            "frontier_z": road_target.get("z"),
         }
 
     counts = inventory_counts(state)
@@ -300,7 +351,9 @@ def build_candidates(state: dict) -> Tuple[Dict[str, str], Dict[str, dict]]:
     if state.get("crafting", {}).get("torch", False) and torch_count == 0:
         criteria["craft_torch"] = (
             "Craft one torch now. This option is exposed only because the game reports that the "
-            "recipe is currently craftable. Strongly prefer before night, especially during dusk."
+            "recipe is currently craftable. If DST auto-equips it during day or dusk, the "
+            "controller immediately unequips it to save fuel. Strongly prefer before night, "
+            "especially during dusk."
         )
         dispatch["craft_torch"] = {"kind": "craft_torch"}
     if torch_count > 0 and not torch_equipped:
@@ -311,7 +364,8 @@ def build_candidates(state: dict) -> Tuple[Dict[str, str], Dict[str, dict]]:
     if torch_equipped:
         criteria["unequip_torch"] = (
             "Unequip the torch from the hand slot and return it to the backpack to preserve fuel. "
-            "Required during day and dusk, and also at night while a lit campfire or firepit is nearby."
+            "Useful during day or dusk, or when remaining beside a lit fire at night. "
+            "If travelling away from fire at night, keep the torch equipped."
         )
         dispatch["unequip_torch"] = {"kind": "unequip_torch"}
 
@@ -363,18 +417,22 @@ def build_candidates(state: dict) -> Tuple[Dict[str, str], Dict[str, dict]]:
         target = min(eligible_chop_targets, key=lambda entity: float(entity.get("distance", 999)))
         required = int(target["work_required"])
         criteria["chop_nearest_tree"] = (
-            f"Chop the nearest tree-like target ({target.get('prefab')}) completely, continuing until it falls. "
+            f"Complete the nearest tree-like target ({target.get('prefab')}) and then pick up "
+            "nearby drops such as logs and pinecones within 4 units of that tree (up to 12 stacks). "
             f"It is {float(target.get('distance', 0)):.2f} units away and is budgeted for {required} chops; "
-            f"the selected axe has at least {axe_uses} uses left."
+            f"the selected axe has at least {axe_uses} uses left. This is one longer action, "
+            "not a single chop."
         )
         dispatch["chop_nearest_tree"] = {"kind": "chop_nearest_tree"}
     if  eligible_mine_targets:
         target = min(eligible_mine_targets, key=lambda entity: float(entity.get("distance", 999)))
         required = int(target["work_required"])
         criteria["mine_nearest_rock"] = (
-            f"Mine the nearest rock target ({target.get('prefab')}) completely, continuing until it breaks. "
+            f"Complete the nearest rock target ({target.get('prefab')}) and then pick up "
+            "nearby drops such as rocks, flint, nitre, and gold within 4 units of that rock (up to 12 stacks). "
             f"It is {float(target.get('distance', 0)):.2f} units away and requires at most {required} strikes; "
-            f"the selected pickaxe has at least {pickaxe_uses} uses left."
+            f"the selected pickaxe has at least {pickaxe_uses} uses left. This is one longer action, "
+            "not a single strike."
         )
         dispatch["mine_nearest_rock"] = {"kind": "mine_nearest_rock"}
     if pursuing_targets:
@@ -405,20 +463,46 @@ def build_candidates(state: dict) -> Tuple[Dict[str, str], Dict[str, dict]]:
             criteria["attack_nearest_hostile"] = (
                 f"Attack the nearest hostile ({target.get('prefab')}) once with the equipped weapon at "
                 f"{threat_distance:.2f} units. Health is {health:.1f}/{health_max:.1f}; prefer fleeing at low health "
-                "or when combat is not necessary. Never attacks neutral creatures."
+                "or when combat is not necessary. Attackable alone does not prove a creature is hostile; "
+                "do not choose this for a neutral target."
             )
             dispatch["attack_nearest_hostile"] = {"kind": "attack_nearest_hostile"}
 
     vitals = state.get("player", {}).get("vitals", {})
     hunger = float(vitals.get("hunger") or 0)
     hunger_max = max(float(vitals.get("hunger_max") or 1), 1)
-    safe_food_count = sum(counts.get(prefab, 0) for prefab in SAFE_FOOD_PREFABS)
-    if safe_food_count > 0 and hunger / hunger_max < 0.80:
+    fire = nearest_cookable_fire(state)
+    raw_food = [prefab for prefab in COOKABLE_FOOD_PRODUCTS if counts.get(prefab, 0) > 0]
+    cook_then_eat = fire is not None and bool(raw_food) and not any(
+        counts.get(prefab, 0) > 0 for prefab in COOKABLE_FOOD_PRODUCTS.values()
+    )
+    if can_eat_safe_food(state) and hunger / hunger_max < 0.80:
+        urgency = (
+            "Hunger is critical: eat immediately; waiting or optional collection risks starvation. "
+            if hunger / hunger_max < CRITICAL_HUNGER_RATIO else ""
+        )
+        if cook_then_eat:
+            eating_plan = (
+                "With no preferred cooked food carried and a nearby lit cooker, cook one item first "
+                "and then eat the cooked food as one action. If cooking fails, safely edible "
+                "raw berries or carrots are a fallback; raw meat is not."
+            )
+        else:
+            eating_plan = "Eat one available safe food item directly; no separate cooking step is needed."
         criteria["eat_safe_food"] = (
-            f"Eat one whitelisted safe food item. Hunger is {hunger:.1f}/{hunger_max:.1f}; "
-            "choose when preserving hunger is more important than saving food."
+            f"{urgency}Hunger is {hunger:.1f}/{hunger_max:.1f}. {eating_plan}"
         )
         dispatch["eat_safe_food"] = {"kind": "eat_safe_food"}
+
+    if fire is not None and raw_food:
+        criteria["cook_food"] = (
+            f"Cook one carried raw food item on the nearby lit {fire['prefab']} "
+            f"{float(fire.get('distance', 0)):.2f} units away. Available raw foods: "
+            f"{', '.join(raw_food)}. The action finishes only after a cooked item appears in inventory. "
+            "Choose this to prepare food for later; when the immediate goal is to eat, "
+            "choose eat_safe_food because it handles cooking if needed."
+        )
+        dispatch["cook_food"] = {"kind": "cook_food"}
 
     if crafting.get("campfire", False):
         criteria["build_campfire"] = (
@@ -434,7 +518,8 @@ def build_candidates(state: dict) -> Tuple[Dict[str, str], Dict[str, dict]]:
         dispatch["build_sciencemachine"] = {"kind": "build_sciencemachine"}
     
     criteria["wait"] = (
-        "Take no action for one telemetry interval. Choose only when moving or collecting is less safe."
+        "Take no action for one telemetry interval. Choose only when no currently useful "
+        "safe action is available or waiting is safer than acting."
     )
     dispatch["wait"] = {"kind": "wait"}
 
@@ -444,33 +529,53 @@ def build_candidates(state: dict) -> Tuple[Dict[str, str], Dict[str, dict]]:
         if action_allowed(state, dispatch[k]["kind"])[0]
     }
     dispatch = {k: v for k, v in dispatch.items() if k in criteria}
-    
     return criteria, dispatch
 
 
-def compact_game_state(state: dict) -> dict:
+def compact_game_state(state: dict, daily_plan: Optional[dict] = None) -> dict:
     world = state.get("world", {})
     player = state.get("player", {})
     vitals = player.get("vitals", {})
+    counts = inventory_counts(state)
+    hunger = float(vitals.get("hunger") or 0)
+    hunger_max = max(float(vitals.get("hunger_max") or 1), 1)
     weapon_equipped, weapon_carried, best_weapon = weapon_status(state)
+    work = state.get("work") or {}
     compact = {
         "goal": "Survive indefinitely and steadily improve food, light, tools, resources, and safety.",
         "hard_rules": [
-            "When a hostile is close, flee if unarmed; with an equipped weapon, fight only when safer than fleeing.",
-            "Never equip a torch during day or dusk; equip it at night only when no lit campfire or firepit is nearby.",
-            "Build a campfire only at night. At night beside a lit campfire or firepit, unequip the torch.",
-            "Prefer nearby required resources over optional food or flowers.",
+            "Choose only an action listed in the available criteria; unavailable actions cannot be executed.",
+            "At night without an equipped torch, exploration and collection are blocked even beside a stationary fire; fleeing an immediate threat is an exception.",
+            "A torch can be equipped only at night and only when no lit campfire or firepit is nearby. A campfire can be built only at night when no lit fire is nearby.",
+        ],
+        "decision_guidance": [
+            "Assess immediate threats, darkness, and starvation before optional progress; compare the remaining safe actions rather than following a fixed script.",
+            "eat_safe_food is a complete eating action: if no preferred cooked food is carried and a lit cooker is nearby, it cooks one item and then eats; cook_food alone only prepares food for later.",
+            "craft_torch is a complete crafting action: if DST auto-equips the new torch before night, the controller unequips it to preserve fuel.",
+            "chop_nearest_tree and mine_nearest_rock include bounded pickup of nearby work drops, including secondary materials. Collect leftovers separately only when useful items remain visible.",
+            "At night near a lit fire, unequip a torch to save fuel only if staying near that fire; keep it equipped when moving away.",
+            "Prefer a useful safe action over repeated waiting, but do not take unnecessary risks for optional resources.",
+            "A daily_plan is strategic advice from a separate planner, not a command. Make the fastest safe next-action choice from current facts; do not generate or revise a plan.",
         ],
         "day": world.get("day"),
         "phase": world.get("phase"),
         "world_time": world.get("time"),
         "health": vitals.get("health"),
         "hunger": vitals.get("hunger"),
+        "hunger_max": vitals.get("hunger_max"),
+        "hunger_fraction": round(hunger / hunger_max, 3),
         "sanity": vitals.get("sanity"),
         "dead": vitals.get("dead"),
         "position": player.get("position"),
         "navigation": state.get("navigation", {}),
-        "inventory": inventory_counts(state),
+        "inventory": counts,
+        "safe_food_count": sum(counts.get(prefab, 0) for prefab in SAFE_FOOD_PREFABS),
+        "cookable_raw_count": sum(counts.get(prefab, 0) for prefab in COOKABLE_FOOD_PRODUCTS),
+        "nearby_cooker": nearest_cookable_fire(state) is not None,
+        "last_work": {
+            "action": work.get("action"),
+            "status": work.get("status"),
+        } if work else None,
         "torch_equipped": has_equipped_torch(state),
         "nearby_lit_fire": has_nearby_lit_fire(state),
         "weapon_equipped": weapon_equipped,
@@ -493,23 +598,28 @@ def compact_game_state(state: dict) -> dict:
             for entity in state.get("nearby", [])
         ],
     }
-    knowledge = first_day_survival_knowledge(state)
-    if knowledge:
-        compact["knowledge"] = knowledge
+    if daily_plan is not None:
+        compact["daily_plan"] = daily_plan
     return compact
 
 
-def call_jev(api_url: str, api_key: str, model: str, state: dict, criteria: Dict[str, str]) -> dict:
+def call_jev(
+    api_url: str, api_key: str, model: str, state: dict,
+    criteria: Dict[str, str], daily_plan: Optional[dict] = None,
+) -> dict:
     body = {
-        "state": json.dumps(compact_game_state(state), ensure_ascii=False, separators=(",", ":")),
+        "state": json.dumps(compact_game_state(state, daily_plan), ensure_ascii=False, separators=(",", ":")),
         "model": model,
         "questions": {
             "next_action": {
                 "type": "choice",
                 "instructions": (
-                    "Choose exactly one available action that most improves long-term survival. "
-                    "Respect every hard rule in the state and use any textual knowledge in the state "
-                    "as game-mechanics context."
+                    "Choose exactly one action key from the supplied criteria. Treat each key as "
+                    "one bounded action, even when the controller performs several verified substeps. "
+                    "Decide the next action quickly from current state and criteria; do not plan ahead. "
+                    "Obey hard rules and immediate survival needs. Treat daily_plan, when present, "
+                    "as optional strategic guidance, never as permission to ignore current facts. "
+                    "Do not request unavailable or redundant substeps."
                 ),
                 "criteria": criteria,
             }
@@ -544,8 +654,16 @@ def call_jev(api_url: str, api_key: str, model: str, state: dict, criteria: Dict
 def execute_action(action: dict, log_path: Path, move_seconds: float = 1.0) -> bool:
     kind = action["kind"]
     if kind == "collect":
-        controller.collect(log_path, action["prefab"], preferred_guid=action.get("guid"))
+        return controller.collect(log_path, action["prefab"], preferred_guid=action.get("guid"))
     elif kind == "explore":
+        if action.get("navigation_mode") == "road":
+            return controller.follow_road(
+                log_path,
+                float(action["frontier_x"]),
+                float(action["frontier_z"]),
+                float(action["leg_distance"]),
+                move_seconds,
+            )
         return controller.explore_leg(
             log_path,
             float(action["target_x"]),
@@ -554,6 +672,7 @@ def execute_action(action: dict, log_path: Path, move_seconds: float = 1.0) -> b
             move_seconds,
             frontier_x=float(action["frontier_x"]),
             frontier_z=float(action["frontier_z"]),
+            navigation_mode=action.get("navigation_mode", "region"),
         )
     elif kind == "wait":
         time.sleep(1.0)
@@ -573,6 +692,8 @@ def execute_action(action: dict, log_path: Path, move_seconds: float = 1.0) -> b
         controller.build_sciencemachine(log_path)
     elif kind == "eat_safe_food":
         controller.eat_safe_food(log_path)
+    elif kind == "cook_food":
+        controller.cook_food(log_path)
     elif kind == "chop_nearest_tree":
         controller.complete_work_action(log_path, kind, "CHOP_workable")
     elif kind == "mine_nearest_rock":
@@ -588,38 +709,27 @@ def execute_action(action: dict, log_path: Path, move_seconds: float = 1.0) -> b
     return True
 
 
-def default_execution_threshold(choice: str) -> float:
-    """Use lower gates for reversible actions and higher gates for committed ones."""
-    if choice == "explore":
+def default_execution_threshold(choice: str, state: Optional[dict] = None) -> float:
+    """Apply the shared gate, with only urgent and riskier actions excepted."""
+    if choice in {"flee_from_nearest_hostile", "wait"}:
+        return 0.0
+    if choice in {"explore", "explore_current_region", "explore_other_region"}:
         return 0.15
-    if choice.startswith("collect_"):
-        return 0.25
-    if choice == "wait":
-        return 0.0
-    if choice == "craft_torch":
-        return 0.45
-    if choice == "equip_torch":
-        return 0.25
-    if choice == "unequip_torch":
-        return 0.25
-    if choice in {"craft_axe", "craft_pickaxe"}:
-        return 0.45
-    if choice in {"chop_nearest_tree", "mine_nearest_rock"}:
-        return 0.45
-    if choice == "eat_safe_food":
-        return 0.35
-    if choice == "build_campfire":
-        return 0.45
-    if choice == "flee_from_nearest_hostile":
-        return 0.0
-    if choice == "equip_weapon":
-        return 0.25
     if choice == "attack_nearest_hostile":
         return 0.45
-    return 0.70
+    if choice == "eat_safe_food" and state is not None:
+        vitals = state.get("player", {}).get("vitals", {})
+        hunger = float(vitals.get("hunger") or 0)
+        hunger_max = max(float(vitals.get("hunger_max") or 1), 1)
+        if hunger / hunger_max < CRITICAL_HUNGER_RATIO:
+            return 0.0
+    return 0.25
 
 
-def run_decision_cycle(args, api_url: str, api_key: str, model: str) -> bool:
+def run_decision_cycle(
+    args, api_url: str, api_key: str, model: str,
+    planner: Optional[DailyPlanner] = None,
+) -> bool:
     """Run one sense-decide-act cycle. Return True at a terminal game state."""
     state, _ = controller.latest_state(args.log)
     world = state.get("world", {})
@@ -627,8 +737,9 @@ def run_decision_cycle(args, api_url: str, api_key: str, model: str) -> bool:
     if vitals.get("dead"):
         print("goal_failed: player is dead; control loop stopped")
         return True
+    daily_plan = planner.update(state) if planner is not None else None
     criteria, dispatch = build_candidates(state)
-    result = call_jev(api_url, api_key, model, state, criteria)
+    result = call_jev(api_url, api_key, model, state, criteria, daily_plan)
     answer = result["answer"]
     choice = answer["choice"]
     confidence = float(answer.get("confidence", 0))
@@ -649,14 +760,21 @@ def run_decision_cycle(args, api_url: str, api_key: str, model: str) -> bool:
     threshold = (
         args.min_confidence
         if args.min_confidence is not None
-        else default_execution_threshold(choice)
+        else default_execution_threshold(choice, state)
     )
     print(f"execution_threshold={threshold:.2f}")
     if confidence < threshold:
         print(f"abstained: confidence below {threshold:.2f}")
         return False
 
-    executed = execute_action(dispatch[choice], args.log, args.move_seconds)
+    try:
+        executed = execute_action(dispatch[choice], args.log, args.move_seconds)
+    except (RuntimeError, OSError, ValueError):
+        if planner is not None:
+            planner.record_action(state, choice, "failed")
+        raise
+    if planner is not None:
+        planner.record_action(state, choice, "executed" if executed else "skipped")
     print("action_executed" if executed else "action_skipped: state changed before execution")
     return False
 
@@ -733,10 +851,11 @@ def main() -> int:
         assert loose_dispatch["collect_log"] == {"kind": "collect", "prefab": "log", "guid": 102}
         assert loose_dispatch["collect_rocks"] == {"kind": "collect", "prefab": "rocks", "guid": 103}
         assert compact_game_state(sample)["goal"].startswith("Survive")
-        assert default_execution_threshold("explore") == 0.15
+        assert default_execution_threshold("explore_current_region") == 0.15
+        assert default_execution_threshold("explore_other_region") == 0.15
         assert default_execution_threshold("collect_grass") == 0.25
-        assert default_execution_threshold("craft_torch") == 0.45
-        assert default_execution_threshold("build_campfire") == 0.45
+        assert default_execution_threshold("craft_torch") == 0.25
+        assert default_execution_threshold("build_campfire") == 0.25
         assert default_execution_threshold("wait") == 0.0
         assert "craft_torch" not in criteria
         craftable = dict(sample)
@@ -814,6 +933,12 @@ def main() -> int:
         raise RuntimeError(f"JEV_API_KEY is missing or empty in {env_path}")
     api_url = os.environ.get("JEV_API_URL", DEFAULT_API_URL)
     model = os.environ.get("JEV_MODEL", DEFAULT_MODEL)
+    deepseek_key = os.environ.get("DEEPSEEK_API_KEY")
+    planner = DailyPlanner(
+        deepseek_key,
+        os.environ.get("DEEPSEEK_API_URL", "https://api.deepseek.com/chat/completions"),
+        os.environ.get("DEEPSEEK_MODEL", "deepseek-flash"),
+    ) if deepseek_key and args.loop and args.execute else None
     if not 0.0 <= args.interval <= 60.0:
         raise ValueError("--interval must be between 0 and 60 seconds")
     if not 0.2 <= args.move_seconds <= 2.0:
@@ -822,6 +947,8 @@ def main() -> int:
     if args.loop:
         mode = "execute" if args.execute else "dry-run"
         print(f"control_loop_started mode={mode} interval={args.interval:.1f}s")
+        if planner is None and args.execute:
+            print("daily_planner_disabled: DEEPSEEK_API_KEY not set")
 
     cycle = 0
     consecutive_errors = 0
@@ -830,7 +957,7 @@ def main() -> int:
         if args.loop:
             print(f"cycle={cycle}")
         try:
-            terminal = run_decision_cycle(args, api_url, api_key, model)
+            terminal = run_decision_cycle(args, api_url, api_key, model, planner)
             consecutive_errors = 0
         except (RuntimeError, OSError, ValueError, json.JSONDecodeError) as exc:
             if not args.loop:
@@ -846,6 +973,8 @@ def main() -> int:
             continue
 
         if terminal or not args.loop:
+            if planner is not None:
+                planner.close()
             return 0
         if args.interval > 0:
             time.sleep(args.interval)

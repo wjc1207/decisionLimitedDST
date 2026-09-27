@@ -4,7 +4,7 @@ Exports the local player's structured state to client_log.txt and accepts
 semantic actions from the local JEV controller.
 ]]
 author = "Local JEV Agent"
-version = "1.0.6"
+version = "1.3.2"
 
 api_version = 10
 dst_compatible = true

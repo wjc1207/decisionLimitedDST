@@ -40,9 +40,13 @@ VK = {
     "equip_weapon": 0x7A, # F11
     "build_sciencemachine": 0x7B, # F12
     "reject_frontier": 0x74, # F5
+    "reject_road": 0x73, # F4
+    "cook_food": 0x72, # F3
 }
 MOVEMENT_KEYS = (VK["up"], VK["left"], VK["down"], VK["right"])
 EXPLORATION_STALL = {"target": None, "count": 0, "last_position": None}
+REGION_ARRIVAL_DISTANCE = 1.5
+ROAD_ARRIVAL_DISTANCE = 1.25
 
 INPUT_KEYBOARD = 1
 KEYEVENTF_KEYUP = 0x0002
@@ -247,6 +251,20 @@ COLLECT_PRODUCTS = {
     "berrybush2": "berries",
     "juicyberrybush": "berries_juicy",
 }
+ROAD_INTEREST_PREFABS = set(COLLECT_PRODUCTS) | {
+    "twigs", "cutgrass", "flint", "log", "rocks", "goldnugget",
+    "nitre", "pinecone", "acorn", "charcoal", "marble", "moonrocknugget",
+    "berries", "carrot", "carrot_planted", "seeds",
+}
+WORK_DROP_PREFABS = {
+    "CHOP_workable": frozenset({
+        "log", "pinecone", "acorn", "charcoal", "livinglog", "twigs",
+    }),
+    "MINE_workable": frozenset({
+        "rocks", "flint", "nitre", "goldnugget", "marble", "moonrocknugget",
+        "ice", "redgem", "bluegem", "purplegem", "thulecite", "thulecite_pieces",
+    }),
+}
 
 
 def collect_target_available(target: Optional[dict]) -> bool:
@@ -344,6 +362,13 @@ def has_nearby_lit_fire(state: dict, maximum_distance: float = 8.0) -> bool:
     )
 
 
+def night_travel_without_torch(state: dict) -> bool:
+    return (
+        state.get("world", {}).get("phase") == "night"
+        and item_count(state, "torch", equipped_only=True) == 0
+    )
+
+
 def status_text(state: dict) -> str:
     player = state.get("player", {})
     world = state.get("world", {})
@@ -363,9 +388,19 @@ def explore_leg(
     full_leg_seconds: float = 1.0,
     frontier_x: Optional[float] = None,
     frontier_z: Optional[float] = None,
+    navigation_mode: str = "region",
 ) -> bool:
+    def section(observed: dict) -> dict:
+        navigation = observed.get("navigation", {})
+        return navigation if navigation_mode == "region" else navigation.get("road") or {}
+
     state, log_position = latest_state(log_path)
-    navigation = state.get("navigation", {})
+    if night_travel_without_torch(state):
+        print("explore leg skipped: night requires an equipped torch, even beside a lit fire")
+        return False
+    if navigation_mode not in {"region", "road"}:
+        raise ValueError(f"Unknown navigation mode: {navigation_mode}")
+    navigation = section(state)
     frontier = navigation.get("target") or {}
     if navigation.get("status") != "ready" or not frontier:
         print("explore leg skipped: frontier is no longer available")
@@ -392,8 +427,9 @@ def explore_leg(
         raise RuntimeError("Telemetry has no player position for frontier exploration")
     start_x = float(position["x"])
     start_z = float(position["z"])
-    if EXPLORATION_STALL["target"] != frontier_key:
-        EXPLORATION_STALL.update(target=frontier_key, count=0, last_position=None)
+    stall_key = (navigation_mode, *frontier_key)
+    if EXPLORATION_STALL["target"] != stall_key:
+        EXPLORATION_STALL.update(target=stall_key, count=0, last_position=None)
     previous_position = EXPLORATION_STALL["last_position"]
     if previous_position is not None and math.hypot(
         start_x - previous_position[0], start_z - previous_position[1]
@@ -402,20 +438,61 @@ def explore_leg(
     dx = target_x - float(position["x"])
     dz = target_z - float(position["z"])
     remaining = math.hypot(dx, dz)
-    if remaining <= 0.15:
-        print("explore leg skipped: leg target already reached")
+    arrival_distance = ROAD_ARRIVAL_DISTANCE if navigation_mode == "road" else REGION_ARRIVAL_DISTANCE
+    if remaining <= arrival_distance:
+        print("explore leg skipped: leg target is within arrival tolerance")
         return False
-    keys = movement_keys_for_delta(state, dx, dz)
-    if not keys:
-        raise RuntimeError("Cannot derive movement keys for frontier leg")
-    duration = full_leg_seconds * min(1.0, max(0.2, min(remaining, leg_distance) / 4.0))
     hwnd = find_game_window()
     focus_game(hwnd)
-    try:
-        tap(keys, duration)
-        fresh, fresh_position = wait_for_fresh_state(log_path, log_position)
-    finally:
-        release_movement_keys()
+    fresh = state
+    fresh_position = log_position
+    total_duration = 0.0
+    route_changed = False
+    light_lost = False
+    pulses = 4 if navigation_mode == "road" else 1
+    for _ in range(pulses):
+        if night_travel_without_torch(fresh):
+            light_lost = True
+            break
+        current_position = fresh.get("player", {}).get("position", {})
+        dx = target_x - float(current_position["x"])
+        dz = target_z - float(current_position["z"])
+        distance = math.hypot(dx, dz)
+        if distance <= arrival_distance:
+            break
+        keys = movement_keys_for_delta(fresh, dx, dz)
+        if not keys:
+            raise RuntimeError("Cannot derive movement keys for exploration leg")
+        if navigation_mode == "road":
+            # Brake before narrow road waypoints; telemetry closes the loop.
+            duration = min(0.5, max(0.08, full_leg_seconds * distance / 4.0 * 0.65))
+        else:
+            duration = full_leg_seconds * min(1.0, max(0.2, min(distance, leg_distance) / 4.0))
+        try:
+            tap(keys, duration)
+        finally:
+            release_movement_keys()
+        total_duration += duration
+        # A sample produced while the key was still held is not a post-move
+        # position. Discard it and wait for the next telemetry record.
+        _, after_release_position = latest_state(log_path)
+        fresh, fresh_position = wait_for_fresh_state(
+            log_path, max(fresh_position, after_release_position)
+        )
+        if night_travel_without_torch(fresh):
+            light_lost = True
+            break
+        if navigation_mode == "road":
+            updated_target = section(fresh).get("target") or {}
+            updated_key = (
+                round(float(updated_target.get("x", math.inf)), 2),
+                round(float(updated_target.get("z", math.inf)), 2),
+            )
+            if updated_key != frontier_key:
+                route_changed = True
+                break
+            if nearest_hostile(fresh, maximum_distance=6.0):
+                break
     after = fresh.get("player", {}).get("position", {})
     if after.get("x") is None or after.get("z") is None:
         raise RuntimeError("Fresh telemetry has no player position after exploration")
@@ -423,25 +500,33 @@ def explore_leg(
     end_z = float(after["z"])
     progress = remaining - math.hypot(target_x - end_x, target_z - end_z)
     EXPLORATION_STALL["last_position"] = (end_x, end_z)
+    if light_lost:
+        EXPLORATION_STALL.update(target=None, count=0, last_position=None)
+        print("explore leg stopped: night requires an equipped torch")
+        return True
+    if route_changed:
+        EXPLORATION_STALL.update(target=None, count=0, last_position=None)
+        print(f"road route changed after movement; progress={progress:.2f} units")
+        return True
     if progress < 0.15:
         EXPLORATION_STALL["count"] += 1
         print(f"frontier leg made insufficient progress ({progress:.2f} units); "
               f"consecutive stalls={EXPLORATION_STALL['count']}")
-        current_target = fresh.get("navigation", {}).get("target") or {}
+        current_target = section(fresh).get("target") or {}
         current_key = (
             round(float(current_target.get("x", math.inf)), 2),
             round(float(current_target.get("z", math.inf)), 2),
         )
         if EXPLORATION_STALL["count"] >= 2 and current_key == frontier_key:
-            tap([VK["reject_frontier"]], 0.08)
+            tap([VK["reject_road" if navigation_mode == "road" else "reject_frontier"]], 0.08)
             wait_for_state_condition(
                 log_path,
                 fresh_position,
                 lambda updated: (
-                    updated.get("navigation", {}).get("target") is None
+                    section(updated).get("target") is None
                     or (
-                        round(float(updated["navigation"]["target"]["x"]), 2),
-                        round(float(updated["navigation"]["target"]["z"]), 2),
+                        round(float(section(updated)["target"]["x"]), 2),
+                        round(float(section(updated)["target"]["z"]), 2),
                     ) != frontier_key
                 ),
                 timeout=3.0,
@@ -452,9 +537,97 @@ def explore_leg(
     EXPLORATION_STALL["count"] = 0
     print(
         f"frontier leg completed: target=({target_x:.2f},{target_z:.2f}) "
-        f"planned={leg_distance:.2f} progress={progress:.2f} duration={duration:.2f}s"
+        f"planned={leg_distance:.2f} progress={progress:.2f} duration={total_duration:.2f}s"
     )
     return True
+
+
+def follow_road(
+    log_path: Path,
+    target_x: float,
+    target_z: float,
+    leg_distance: float,
+    full_leg_seconds: float = 1.0,
+    max_distance: float = 10.0,
+    max_legs: int = 8,
+) -> bool:
+    """Follow several live road waypoints in one bounded JEV action."""
+    initial, _ = latest_state(log_path)
+    initial_region = initial.get("navigation", {}).get("current_region")
+    initial_biome = initial.get("navigation", {}).get("current_biome")
+    initial_phase = initial.get("world", {}).get("phase")
+    seen_collectibles = {
+        entity.get("guid") for entity in initial.get("nearby", [])
+        if entity.get("guid") is not None
+        and collect_target_available(entity)
+    }
+    distance_walked = 0.0
+    completed_legs = 0
+    new_resource_seen = False
+    for index in range(max_legs):
+        current, _ = latest_state(log_path)
+        road = current.get("navigation", {}).get("road") or {}
+        waypoint = road.get("target") or {}
+        leg = road.get("leg") or {}
+        if road.get("status") != "ready" or not waypoint or not leg:
+            break
+        if night_travel_without_torch(current) or nearest_hostile(current, maximum_distance=6.0):
+            break
+        if current.get("world", {}).get("phase") != initial_phase:
+            break
+        navigation = current.get("navigation", {})
+        biome = navigation.get("current_biome")
+        if initial_biome is not None and biome is not None:
+            if biome != initial_biome:
+                break
+        elif initial_region is not None and navigation.get("current_region") != initial_region:
+            break
+        if index == 0 and (
+            round(float(waypoint["x"]), 2), round(float(waypoint["z"]), 2)
+        ) != (round(target_x, 2), round(target_z, 2)):
+            print("road follow skipped: waypoint changed since JEV decision")
+            return False
+        if distance_walked + float(leg.get("distance") or leg_distance) > max_distance:
+            break
+        before = current.get("player", {}).get("position", {})
+        moved = explore_leg(
+            log_path,
+            float(leg["x"]), float(leg["z"]), float(leg.get("distance") or leg_distance),
+            full_leg_seconds,
+            frontier_x=float(waypoint["x"]), frontier_z=float(waypoint["z"]),
+            navigation_mode="road",
+        )
+        if not moved:
+            break
+        updated, _ = latest_state(log_path)
+        after = updated.get("player", {}).get("position", {})
+        progress = math.hypot(
+            float(after.get("x", 0)) - float(before.get("x", 0)),
+            float(after.get("z", 0)) - float(before.get("z", 0)),
+        )
+        if progress < 0.15:
+            break
+        distance_walked += progress
+        completed_legs += 1
+        if distance_walked >= max_distance:
+            break
+        new_resource_seen = new_resource_seen or any(
+            entity.get("guid") is not None
+            and entity["guid"] not in seen_collectibles
+            and entity.get("prefab") in ROAD_INTEREST_PREFABS
+            and float(entity.get("distance", math.inf)) <= 2.5
+            and collect_target_available(entity)
+            for entity in updated.get("nearby", [])
+        )
+        vitals = updated.get("player", {}).get("vitals", {})
+        hunger = float(vitals.get("hunger") or 0)
+        hunger_max = max(float(vitals.get("hunger_max") or 1), 1)
+        if hunger / hunger_max < 0.30 and safe_food_count(updated) > 0:
+            break
+        if new_resource_seen and distance_walked >= 4.0:
+            break
+    print(f"road follow completed: legs={completed_legs} distance={distance_walked:.2f}")
+    return completed_legs > 0
 
 
 def item_count(state: dict, prefab: str, equipped_only: bool = False) -> int:
@@ -589,6 +762,12 @@ def craft_torch(log_path: Path) -> None:
         lambda fresh: item_count(fresh, "torch") > before,
     )
     print(f"craft verified: torch count {before} -> {item_count(verified, 'torch')}")
+    if (
+        verified.get("world", {}).get("phase") != "night"
+        and item_count(verified, "torch", equipped_only=True) > 0
+    ):
+        # DST may auto-equip a newly crafted torch. Preserve fuel before night.
+        unequip_torch(log_path, daylight_only=True)
 
 
 def equip_torch(log_path: Path) -> None:
@@ -613,11 +792,17 @@ def equip_torch(log_path: Path) -> None:
     print("equip verified: torch is equipped")
 
 
-def unequip_torch(log_path: Path) -> None:
+def unequip_torch(log_path: Path, daylight_only: bool = False) -> None:
     state, log_position = latest_state(log_path)
+    if daylight_only and state.get("world", {}).get("phase") == "night":
+        print("craft cleanup skipped: night began before torch could be unequipped")
+        return
     if state.get("world", {}).get("phase") == "night" and not has_nearby_lit_fire(state):
         raise RuntimeError("Cannot unequip the only light source at night; command not sent")
     if item_count(state, "torch", equipped_only=True) <= 0:
+        if daylight_only:
+            print("craft cleanup skipped: torch is already unequipped")
+            return
         raise RuntimeError("A torch is not equipped in the hand slot; command not sent")
     hwnd = find_game_window()
     focus_game(hwnd)
@@ -696,15 +881,37 @@ def build_sciencemachine(log_path: Path) -> None:
     print("build verified: science machine appeared nearby")
 
 
-SAFE_FOOD_PREFABS = ("berries_cooked", "carrot_cooked", "berries", "carrot", "seeds_cooked", "seeds")
+SAFE_FOOD_PREFABS = ("cookedmeat", "cookedsmallmeat", "berries_cooked", "carrot_cooked", "berries", "carrot", "seeds_cooked", "seeds")
+RAW_COOKABLE_FOOD_PREFABS = ("meat", "smallmeat", "berries", "carrot")
+COOKED_FOOD_PREFABS = ("cookedmeat", "cookedsmallmeat", "berries_cooked", "carrot_cooked")
 
 
 def safe_food_count(state: dict) -> int:
     return sum(item_count(state, prefab) for prefab in SAFE_FOOD_PREFABS)
 
 
+def has_nearby_cooker(state: dict, maximum_distance: float = 6.0) -> bool:
+    return any(
+        entity.get("prefab") in {"campfire", "firepit"}
+        and {"fire", "cooker"}.issubset(set(entity.get("tags", [])))
+        and float(entity.get("distance", math.inf)) <= maximum_distance
+        for entity in state.get("nearby", [])
+    )
+
+
 def eat_safe_food(log_path: Path) -> None:
     state, log_position = latest_state(log_path)
+    cooked_count = sum(item_count(state, prefab) for prefab in COOKED_FOOD_PREFABS)
+    raw_count = sum(item_count(state, prefab) for prefab in RAW_COOKABLE_FOOD_PREFABS)
+    if cooked_count == 0 and raw_count > 0 and has_nearby_cooker(state):
+        try:
+            cook_food(log_path)
+        except RuntimeError:
+            state, log_position = latest_state(log_path)
+            if safe_food_count(state) <= 0:
+                raise
+            print("cook failed; eating available safe food instead")
+        state, log_position = latest_state(log_path)
     before_food = safe_food_count(state)
     before_hunger = float(state.get("player", {}).get("vitals", {}).get("hunger", 0))
     if before_food <= 0:
@@ -722,6 +929,26 @@ def eat_safe_food(log_path: Path) -> None:
     )
     after_hunger = verified.get("player", {}).get("vitals", {}).get("hunger")
     print(f"eat verified: hunger {before_hunger} -> {after_hunger}")
+
+
+def cook_food(log_path: Path) -> None:
+    state, log_position = latest_state(log_path)
+    if sum(item_count(state, prefab) for prefab in RAW_COOKABLE_FOOD_PREFABS) <= 0:
+        raise RuntimeError("No whitelisted raw food is available; cook command not sent")
+    if not has_nearby_cooker(state):
+        raise RuntimeError("No nearby lit cooker is available; cook command not sent")
+    before = sum(item_count(state, prefab) for prefab in COOKED_FOOD_PREFABS)
+    hwnd = find_game_window()
+    focus_game(hwnd)
+    tap([VK["cook_food"]], 0.08)
+    verified, _ = wait_for_state_condition(
+        log_path,
+        log_position,
+        lambda fresh: sum(item_count(fresh, prefab) for prefab in COOKED_FOOD_PREFABS) > before,
+        timeout=10.0,
+    )
+    after = sum(item_count(verified, prefab) for prefab in COOKED_FOOD_PREFABS)
+    print(f"cook verified: cooked food {before} -> {after}")
 
 
 def trigger_semantic_action(log_path: Path, action_key: str) -> None:
@@ -761,6 +988,10 @@ def _conservative_tool_uses(state: dict, prefab: str, maximum: int) -> int:
 
 def complete_work_action(log_path: Path, action_key: str, target_tag: str) -> None:
     state, log_position = latest_state(log_path)
+    preexisting_drop_guids = {
+        entity["guid"] for entity in state.get("nearby", [])
+        if entity.get("guid") is not None and "_inventoryitem" in entity.get("tags", [])
+    }
     tool_prefab, maximum = (
         ("axe", 100) if target_tag == "CHOP_workable" else ("pickaxe", 33)
     )
@@ -772,23 +1003,45 @@ def complete_work_action(log_path: Path, action_key: str, target_tag: str) -> No
         and entity.get("work_required") is not None
         and available >= int(entity["work_required"])
     ]
-    target = min(candidates, key=lambda entity: float(entity.get("distance", math.inf)), default=None)
-    if target is None:
+    if not candidates:
         raise RuntimeError(f"No nearby {target_tag} target; command not sent")
-    guid = target.get("guid")
+    previous_sequence = int((state.get("work") or {}).get("sequence") or 0)
     hwnd = find_game_window()
     focus_game(hwnd)
     tap([VK[action_key]], 0.08)
 
-    def completed(fresh: dict) -> bool:
-        current = next(
-            (entity for entity in fresh.get("nearby", []) if entity.get("guid") == guid),
-            None,
+    expected_action = "chop" if target_tag == "CHOP_workable" else "mine"
+    acknowledged, ack_position = wait_for_state_condition(
+        log_path, log_position,
+        lambda fresh: (
+            int((fresh.get("work") or {}).get("sequence") or 0) > previous_sequence
+            and (fresh.get("work") or {}).get("action") == expected_action
+        ),
+        timeout=6.0,
+    )
+    work = acknowledged["work"]
+    sequence = int(work["sequence"])
+    guid = work["target_guid"]
+    origin = (float(work["x"]), float(work["z"]))
+    if work.get("status") not in {"completed", "failed"}:
+        verified, verified_position = wait_for_state_condition(
+            log_path, ack_position,
+            lambda fresh: (
+                int((fresh.get("work") or {}).get("sequence") or 0) == sequence
+                and (fresh.get("work") or {}).get("status") in {"completed", "failed"}
+            ),
+            timeout=35.0,
         )
-        return current is None or target_tag not in current.get("tags", [])
-
-    wait_for_state_condition(log_path, log_position, completed, timeout=35.0)
+        work = verified["work"]
+    else:
+        verified, verified_position = acknowledged, ack_position
+    if work.get("status") != "completed":
+        raise RuntimeError(f"{expected_action} failed: {work.get('reason', 'unknown reason')}")
     print(f"work verified complete: {action_key} target={guid}")
+    collect_nearby_drops(
+        log_path, WORK_DROP_PREFABS[target_tag], origin, verified, verified_position,
+        preexisting_drop_guids=preexisting_drop_guids,
+    )
 
 
 def collect(
@@ -796,7 +1049,8 @@ def collect(
     prefab: str,
     max_steps: int = 16,
     preferred_guid: Optional[int] = None,
-) -> None:
+    strict_preferred: bool = False,
+) -> bool:
     state, log_position = latest_state(log_path)
     hwnd = find_game_window()
     focus_game(hwnd)
@@ -807,10 +1061,13 @@ def collect(
     threat = nearest_hostile(state, maximum_distance=5.0)
     if threat is not None:
         print(f"collection interrupted: hostile={threat.get('prefab')} distance={float(threat.get('distance', 0)):.2f}")
-        return
+        return False
     target = find_collectible_target(state, prefab, preferred_guid)
     if target is None:
         raise RuntimeError(f"No currently collectible target with prefab '{prefab}'; command not sent")
+    if strict_preferred and target.get("guid") != preferred_guid:
+        print(f"collection skipped: preferred {prefab} target is no longer available")
+        return False
     guid = target["guid"]
     original_target = target
     previous_distance = float(target["distance"])
@@ -821,14 +1078,17 @@ def collect(
     print(f"target={prefab} guid={guid} distance={previous_distance:.2f}")
     try:
         for step in range(1, max_steps + 1):
+            if night_travel_without_torch(state):
+                print("collection interrupted: night requires an equipped torch, even beside a lit fire")
+                return False
             threat = nearest_hostile(state, maximum_distance=5.0)
             if threat is not None:
                 print(f"collection interrupted: hostile={threat.get('prefab')} distance={float(threat.get('distance', 0)):.2f}")
-                return
+                return False
             target = find_target(state, prefab, guid)
             if collect_target_completed(original_target, target):
                 print("collection verified: target is no longer collectible")
-                return
+                return True
             distance = float(target["distance"])
             if distance <= 1.0:
                 if not collect_target_available(target):
@@ -837,11 +1097,11 @@ def collect(
                 state, log_position = wait_for_fresh_state(log_path, log_position)
                 if product is not None and item_count(state, product) > product_count_before:
                     print(f"interaction verified: inventory gained {product}")
-                    return
+                    return True
                 remaining = find_target(state, prefab, guid)
                 if collect_target_completed(original_target, remaining):
                     print("interaction verified: target is no longer collectible")
-                    return
+                    return True
                 else:
                     print(f"interaction did not complete; retrying at {float(remaining['distance']):.2f}")
                     continue
@@ -853,7 +1113,7 @@ def collect(
             updated = find_target(state, prefab, guid)
             if collect_target_completed(original_target, updated):
                 print("collection completed while approaching")
-                return
+                return True
             new_distance = float(updated["distance"])
             print(f"step={step} distance={new_distance:.2f}")
             if new_distance >= previous_distance - 0.03:
@@ -866,6 +1126,65 @@ def collect(
         raise RuntimeError("Maximum approach steps reached; stopped safely")
     finally:
         release_movement_keys()
+
+
+def collect_nearby_drops(
+    log_path: Path,
+    expected_prefabs: frozenset[str],
+    origin: tuple[float, float],
+    state: dict,
+    log_position: int,
+    radius: float = 4.0,
+    max_stacks: int = 12,
+    preexisting_drop_guids: Optional[set[int]] = None,
+) -> int:
+    """Collect known work products and newly spawned loose drops near the target."""
+    gathered = 0
+    attempted: set[int] = set()
+    waited_for_drops = False
+    preexisting_drop_guids = preexisting_drop_guids or set()
+    while gathered < max_stacks:
+        if night_travel_without_torch(state) or nearest_hostile(state, maximum_distance=5.0):
+            break
+        position = state.get("player", {}).get("position", {})
+        px, pz = float(position.get("x", 0)), float(position.get("z", 0))
+        candidates = [
+            entity for entity in state.get("nearby", [])
+            if entity.get("guid") is not None
+            and entity["guid"] not in attempted
+            and "_inventoryitem" in entity.get("tags", [])
+            and (entity.get("prefab") in expected_prefabs
+                 or entity["guid"] not in preexisting_drop_guids)
+            and math.hypot(
+                px + float(entity.get("dx", 0)) - origin[0],
+                pz + float(entity.get("dz", 0)) - origin[1],
+            ) <= radius
+        ]
+        if not candidates:
+            if not waited_for_drops:
+                waited_for_drops = True
+                try:
+                    state, log_position = wait_for_fresh_state(log_path, log_position, timeout=1.5)
+                except RuntimeError:
+                    break
+                continue
+            break
+        target = min(candidates, key=lambda entity: float(entity.get("distance", math.inf)))
+        guid = target["guid"]
+        prefab = target["prefab"]
+        attempted.add(guid)
+        try:
+            collected = collect(
+                log_path, prefab, max_steps=8, preferred_guid=guid, strict_preferred=True,
+            )
+        except RuntimeError as exc:
+            print(f"work drop skipped: prefab={prefab} guid={guid} reason={exc}")
+            collected = False
+        if collected:
+            gathered += 1
+        state, log_position = latest_state(log_path)
+    print(f"work drops collected: stacks={gathered}")
+    return gathered
 
 
 def run_self_test() -> int:
@@ -926,6 +1245,7 @@ def main() -> int:
     subparsers.add_parser("craft-pickaxe")
     subparsers.add_parser("build-campfire")
     subparsers.add_parser("eat")
+    subparsers.add_parser("cook")
     subparsers.add_parser("chop")
     subparsers.add_parser("mine")
     subparsers.add_parser("attack")
@@ -971,11 +1291,14 @@ def main() -> int:
     if args.command == "eat":
         eat_safe_food(args.log)
         return 0
+    if args.command == "cook":
+        cook_food(args.log)
+        return 0
     if args.command == "chop":
-        trigger_semantic_action(args.log, "chop_nearest_tree")
+        complete_work_action(args.log, "chop_nearest_tree", "CHOP_workable")
         return 0
     if args.command == "mine":
-        trigger_semantic_action(args.log, "mine_nearest_rock")
+        complete_work_action(args.log, "mine_nearest_rock", "MINE_workable")
         return 0
     if args.command == "attack":
         force_attack(args.log)

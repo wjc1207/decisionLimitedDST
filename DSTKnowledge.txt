@@ -1,0 +1,42 @@
+Don't Starve Together planning reference (standard Wilson-style recipes)
+
+This is strategic background, not live game state. Inventory, recipe availability,
+nearby entities, and the controller's allowed actions must be checked from telemetry.
+Character-specific recipes, world settings, and special circumstances may differ.
+
+Core recipes (verified against this DST installation's scripts/recipes.lua):
+- Torch: 2 cut grass (cutgrass) + 2 twigs (twigs); no science station required.
+- Axe: 1 twig + 1 flint; no science station required.
+- Pickaxe: 2 twigs + 2 flint; no science station required.
+- Campfire: 3 cut grass + 2 logs; no science station required.
+- Fire pit: 2 logs + 12 rocks; no science station required.
+- Science Machine (recipe name researchlab): 1 gold nugget + 4 logs + 4 rocks;
+  no science station required. This is the current longer-term milestone.
+- Rope: 3 cut grass; normally requires a Science Machine to prototype.
+- Spear: 2 twigs + 1 rope + 1 flint; normally requires a Science Machine.
+
+Planning considerations:
+- A torch is portable light. A campfire or fire pit is stationary and does not
+  light the route away from it. Secure light before darkness.
+- Torch fuel is consumed while equipped. This controller automatically unequips
+  a torch auto-equipped by crafting during day or dusk, but keeps it at night.
+- Chopping and mining actions include bounded pickup near the completed target.
+  Trees may yield logs and seeds (such as pinecones or acorns); mined rocks may
+  yield rocks, flint, nitre, or gold, depending on the target.
+- The eat_safe_food action can cook carried raw food at a nearby lit cooker and
+  then eat it when needed. Do not plan a separate cook action solely for that.
+- Exploration is bounded. explore_current_region surveys a frontier leg on the
+  current ground-tile biome; explore_other_region follows an observed road to
+  look for a different biome, but the road may end first. Forest, grassland,
+  savanna, swamp, rocky ground, deciduous forest, and desert are tile cues,
+  not guarantees of resources. Spawn and mixed areas are not single tile types.
+  Oasis and ordinary desert share desert ground cues; do not infer an oasis
+  without additional evidence. Prioritize resources actually observed nearby.
+- Terrain is only a search hint: forest often has trees and saplings; grassland
+  often has grass and saplings; savanna often has grass and may have beefalo;
+  rocky ground often has rocks and flint; swamp can contain reeds and hostile
+  creatures. World generation varies, so never assume an unseen resource is
+  present or safe to reach. For a needed material, prefer a biome likely to
+  contain it, then verify via the live nearby-entity observations.
+- Prefer feasible resource prerequisites and immediate survival over an invented
+  objective. A planned recipe is not necessarily currently craftable.

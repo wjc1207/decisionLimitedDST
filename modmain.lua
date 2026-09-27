@@ -15,7 +15,26 @@ local NAV_OBSERVE_RADIUS = SCAN_RADIUS
 local NAV_LEG_DISTANCE = 4
 local NAV_PROBE_STEP = 0.75
 local NAV_ARRIVAL_DISTANCE = 1.5
+local ROAD_ARRIVAL_DISTANCE = 1.25
 local NAV_BLACKLIST_SECONDS = 30
+local ROAD_CELL_SIZE = 2
+local ROAD_SCAN_RADIUS = 8
+local ROAD_SCAN_BUDGET = 20
+
+-- A topology node is a world-generation branch, not a biome. Classify only
+-- ground tiles whose meaning is unambiguous; roads and player-laid floors do
+-- not create a new biome. Spawn and mixed areas need context, not a tile ID.
+local BIOME_BY_TILE =
+{
+    [G.GROUND.FOREST] = "forest",
+    [G.GROUND.GRASS] = "grassland",
+    [G.GROUND.SAVANNA] = "savanna",
+    [G.GROUND.MARSH] = "swamp",
+    [G.GROUND.ROCKY] = "rocky",
+    [G.GROUND.DECIDUOUS] = "deciduous_forest",
+    [G.GROUND.DESERT_DIRT] = "desert",
+    [G.GROUND.DIRT] = "dirt",
+}
 
 local EXCLUDE_TAGS = { "INLIMBO", "NOCLICK", "FX", "DECOR" }
 local RELEVANT_TAGS =
@@ -30,6 +49,7 @@ local RELEVANT_TAGS =
     "_combat",
     "fire",
     "campfire",
+    "cooker",
 }
 
 -- Conservative whole-target workloads from the shipped DST scripts. Trees
@@ -95,6 +115,12 @@ local RELEVANT_PREFABS =
     hound = true,
     tentacle = true,
     goldnugget = true,
+    nitre = true,
+    pinecone = true,
+    acorn = true,
+    charcoal = true,
+    marble = true,
+    moonrocknugget = true,
     sciencemachine = true,
 }
 
@@ -364,6 +390,20 @@ local function get_navigation_memory(world)
         {
             cells = {},
             target = nil,
+            road_target = nil,
+            road_cells = {},
+            road_edges = {},
+            road_blacklist = {},
+            last_road_cell = nil,
+            regions = {},
+            current_region = nil,
+            current_region_name = nil,
+            current_biome = nil,
+            pending_biome = nil,
+            pending_biome_samples = 0,
+            biomes = {},
+            pending_region = nil,
+            pending_region_samples = 0,
             blacklist = {},
             last_player_cell = nil,
         }
@@ -390,6 +430,13 @@ local function observe_navigation_cells(player, world, memory)
                 cell.passable = safe_call(function()
                     return map:IsPassableAtPoint(x, 0, z, false, false)
                 end, false)
+                cell.region = safe_call(function()
+                    local id = map:GetTopologyIDAtPoint(x, 0, z)
+                    return id ~= nil and tostring(id) or nil
+                end, nil)
+                cell.biome = BIOME_BY_TILE[safe_call(function()
+                    return map:GetTileAtPoint(x, 0, z)
+                end, nil)]
                 cell.last_seen = now
                 memory.cells[key] = cell
             end
@@ -411,7 +458,8 @@ local function frontier_candidates(player, memory)
     local now = G.GetTime()
     local candidates = {}
     for key, cell in pairs(memory.cells) do
-        if cell.passable and (memory.blacklist[key] or 0) <= now then
+        if cell.passable and (memory.current_biome == nil or cell.biome == memory.current_biome)
+            and (memory.blacklist[key] or 0) <= now then
             local information_gain = 0
             for _, offset in ipairs(NAV_NEIGHBORS) do
                 if memory.cells[nav_key(cell.gx + offset[1], cell.gz + offset[2])] == nil then
@@ -444,12 +492,12 @@ local function frontier_candidates(player, memory)
     return candidates
 end
 
-local function make_navigation_leg(player, map, target)
+local function make_navigation_leg(player, map, target, arrival_distance)
     local px, py, pz = player.Transform:GetWorldPosition()
     local dx = target.x - px
     local dz = target.z - pz
     local remaining = math.sqrt(dx * dx + dz * dz)
-    if remaining <= NAV_ARRIVAL_DISTANCE then
+    if remaining <= (arrival_distance or NAV_ARRIVAL_DISTANCE) then
         return nil, "arrived"
     end
     local leg_distance = math.min(NAV_LEG_DISTANCE, remaining)
@@ -481,6 +529,11 @@ local function make_navigation_leg(player, map, target)
     }, nil
 end
 
+local observe_current_region
+local observe_current_biome
+local observe_road_cells
+local select_road_target
+
 local function read_navigation(player)
     local world = G.TheWorld
     local map = world ~= nil and world.Map or nil
@@ -488,7 +541,14 @@ local function read_navigation(player)
         return {}
     end
     local memory = get_navigation_memory(world)
+    local px, py, pz = player.Transform:GetWorldPosition()
+    local current_ground_tile = safe_call(function()
+        return map:GetTileAtPoint(px, 0, pz)
+    end, nil)
+    observe_current_region(player, map, memory)
+    observe_current_biome(player, map, memory)
     observe_navigation_cells(player, world, memory)
+    local on_road = observe_road_cells(player, map, memory)
     local candidates = frontier_candidates(player, memory)
     local now = G.GetTime()
     local leg = nil
@@ -531,9 +591,29 @@ local function read_navigation(player)
         local px, py, pz = player.Transform:GetWorldPosition()
         target.distance = math.sqrt((target.x - px) * (target.x - px) + (target.z - pz) * (target.z - pz))
     end
+    local road_target, road_leg, road_status = select_road_target(player, map, memory, on_road)
+    local known_regions = 0
+    for _ in pairs(memory.regions) do
+        known_regions = known_regions + 1
+    end
+    local known_biomes = 0
+    local biomes_seen = {}
+    for biome in pairs(memory.biomes) do
+        known_biomes = known_biomes + 1
+        table.insert(biomes_seen, biome)
+    end
+    table.sort(biomes_seen)
     return
     {
-        mode = "frontier",
+        mode = "region_and_road",
+        current_region = memory.current_region,
+        current_region_name = memory.current_region_name,
+        known_regions = known_regions,
+        current_biome = memory.current_biome,
+        current_ground_tile = current_ground_tile,
+        known_biomes = known_biomes,
+        biomes_seen = biomes_seen,
+        on_road = on_road,
         status = status,
         cell_size = NAV_CELL_SIZE,
         observed_cells = observed_cells,
@@ -555,7 +635,283 @@ local function read_navigation(player)
             dz = round(leg.dz, 2),
             distance = round(leg.distance, 2),
         } or nil,
+        road =
+        {
+            status = road_status,
+            target = road_target ~= nil and
+            {
+                x = round(road_target.x, 2),
+                z = round(road_target.z, 2),
+                distance = round(road_target.distance, 2),
+            } or nil,
+            leg = road_leg ~= nil and
+            {
+                x = round(road_leg.x, 2),
+                z = round(road_leg.z, 2),
+                dx = round(road_leg.dx, 2),
+                dz = round(road_leg.dz, 2),
+                distance = round(road_leg.distance, 2),
+            } or nil,
+        },
     }
+end
+
+local function observed_region_at(map, x, z)
+    local id = safe_call(function()
+        local topology_id = map:GetTopologyIDAtPoint(x, 0, z)
+        return topology_id
+    end, nil)
+    if id ~= nil and id ~= "" then
+        return tostring(id)
+    end
+    return nil
+end
+
+observe_current_region = function(player, map, memory)
+    local px, py, pz = player.Transform:GetWorldPosition()
+    local observed = observed_region_at(map, px, pz)
+    if observed == nil then
+        return
+    end
+    if memory.current_region == nil then
+        memory.current_region = observed
+        local data = safe_call(function() return G.ConvertTopologyIdToData(observed) end, {}) or {}
+        memory.current_region_name = data.task_id or data.layout_id or observed
+    elseif observed ~= memory.current_region then
+        if memory.pending_region == observed then
+            memory.pending_region_samples = memory.pending_region_samples + 1
+        else
+            memory.pending_region = observed
+            memory.pending_region_samples = 1
+        end
+        if memory.pending_region_samples >= 2 then
+            memory.current_region = observed
+            local data = safe_call(function() return G.ConvertTopologyIdToData(observed) end, {}) or {}
+            memory.current_region_name = data.task_id or data.layout_id or observed
+            memory.pending_region = nil
+            memory.pending_region_samples = 0
+            memory.road_target = nil
+        end
+    else
+        memory.pending_region = nil
+        memory.pending_region_samples = 0
+    end
+    local region = memory.regions[memory.current_region] or { observations = 0 }
+    region.observations = region.observations + 1
+    memory.regions[memory.current_region] = region
+end
+
+local function biome_at(map, x, z)
+    local tile = safe_call(function() return map:GetTileAtPoint(x, 0, z) end, nil)
+    return BIOME_BY_TILE[tile]
+end
+
+observe_current_biome = function(player, map, memory)
+    local px, py, pz = player.Transform:GetWorldPosition()
+    local observed = biome_at(map, px, pz)
+    if observed == nil then
+        -- A road or artificial floor hides the natural tile. Sample nearby
+        -- ground rather than treating the road as its own biome.
+        local votes = {}
+        for _, offset in ipairs(NAV_NEIGHBORS) do
+            local neighbor = biome_at(map, px + offset[1] * 3, pz + offset[2] * 3)
+            if neighbor ~= nil then
+                votes[neighbor] = (votes[neighbor] or 0) + 1
+            end
+        end
+        local best_count = 0
+        for biome, count in pairs(votes) do
+            if count > best_count or (count == best_count and biome == memory.current_biome) then
+                observed = biome
+                best_count = count
+            end
+        end
+    end
+    if observed == nil then
+        return
+    end
+    if memory.current_biome == nil then
+        memory.current_biome = observed
+    elseif observed ~= memory.current_biome then
+        if memory.pending_biome == observed then
+            memory.pending_biome_samples = memory.pending_biome_samples + 1
+        else
+            memory.pending_biome = observed
+            memory.pending_biome_samples = 1
+        end
+        if memory.pending_biome_samples >= 2 then
+            memory.current_biome = observed
+            memory.pending_biome = nil
+            memory.pending_biome_samples = 0
+            memory.target = nil
+        end
+    else
+        memory.pending_biome = nil
+        memory.pending_biome_samples = 0
+    end
+    memory.biomes[memory.current_biome] = true
+end
+
+local function is_road_point(map, x, z)
+    local road_manager = G.RoadManager
+    if road_manager ~= nil and safe_call(function()
+        return road_manager:IsOnRoad(x, 0, z)
+    end, false) then
+        return true
+    end
+    local tile = safe_call(function() return map:GetTileAtPoint(x, 0, z) end, nil)
+    return tile ~= nil and G.GROUND_ROADWAYS ~= nil and G.GROUND_ROADWAYS[tile] == true
+end
+
+observe_road_cells = function(player, map, memory)
+    local px, py, pz = player.Transform:GetWorldPosition()
+    local pgx = math.floor(px / ROAD_CELL_SIZE + 0.5)
+    local pgz = math.floor(pz / ROAD_CELL_SIZE + 0.5)
+    local road_here = is_road_point(map, px, pz)
+    local player_key = nav_key(pgx, pgz)
+    if road_here and memory.last_road_cell ~= player_key then
+        local cell = memory.road_cells[player_key] or
+            { gx = pgx, gz = pgz, x = px, z = pz, visits = 0 }
+        cell.x = px
+        cell.z = pz
+        cell.gx = pgx
+        cell.gz = pgz
+        cell.road = true
+        cell.visits = (cell.visits or 0) + 1
+        memory.road_cells[player_key] = cell
+        memory.last_road_cell = player_key
+    elseif not road_here then
+        memory.last_road_cell = nil
+    end
+    local scan = {}
+    for gx = pgx - 4, pgx + 4 do
+        for gz = pgz - 4, pgz + 4 do
+            local x = gx * ROAD_CELL_SIZE
+            local z = gz * ROAD_CELL_SIZE
+            local distance = math.sqrt((x - px) * (x - px) + (z - pz) * (z - pz))
+            local key = nav_key(gx, gz)
+            if distance <= ROAD_SCAN_RADIUS and memory.road_cells[key] == nil then
+                table.insert(scan, { key = key, x = x, z = z, distance = distance })
+            end
+        end
+    end
+    table.sort(scan, function(a, b) return a.distance < b.distance end)
+    for i = 1, math.min(ROAD_SCAN_BUDGET, #scan) do
+        local sample = scan[i]
+        memory.road_cells[sample.key] =
+        {
+            gx = math.floor(sample.x / ROAD_CELL_SIZE + 0.5),
+            gz = math.floor(sample.z / ROAD_CELL_SIZE + 0.5),
+            x = sample.x,
+            z = sample.z,
+            road = is_road_point(map, sample.x, sample.z),
+            visits = 0,
+        }
+    end
+    return road_here
+end
+
+select_road_target = function(player, map, memory, on_road)
+    local px, py, pz = player.Transform:GetWorldPosition()
+    local now = G.GetTime()
+    local target = memory.road_target
+    local leg = nil
+    local status = "no_road"
+    if target ~= nil then
+        leg, status = make_navigation_leg(player, map, target, ROAD_ARRIVAL_DISTANCE)
+        if status == "arrived" then
+            local cell = memory.road_cells[target.key]
+            if cell ~= nil and on_road then
+                cell.visits = (cell.visits or 0) + 1
+            else
+                memory.road_blacklist[target.key] = now + NAV_BLACKLIST_SECONDS
+            end
+            memory.road_target = nil
+        elseif status == "blocked" then
+            memory.road_blacklist[target.key] = now + NAV_BLACKLIST_SECONDS
+            memory.road_target = nil
+        end
+    end
+    if memory.road_target == nil then
+        local starts = {}
+        for key, cell in pairs(memory.road_cells) do
+            if cell.road and (memory.road_blacklist[key] or 0) <= now then
+                local distance = math.sqrt((cell.x - px) * (cell.x - px) + (cell.z - pz) * (cell.z - pz))
+                if distance <= (on_road and 3 or ROAD_SCAN_RADIUS)
+                    and (not on_road or distance < 0.5
+                        or is_road_point(map, (px + cell.x) / 2, (pz + cell.z) / 2)) then
+                    table.insert(starts, { key = key, distance = distance })
+                end
+            end
+        end
+        table.sort(starts, function(a, b) return a.distance < b.distance end)
+        for _, start in ipairs(starts) do
+            local queue = { start.key }
+            local parent = { [start.key] = false }
+            local head = 1
+            local goal_key = nil
+            while head <= #queue do
+                local key = queue[head]
+                head = head + 1
+                local cell = memory.road_cells[key]
+                if (cell.visits or 0) == 0 and (memory.road_blacklist[key] or 0) <= now then
+                    goal_key = key
+                    break
+                end
+                for _, offset in ipairs(NAV_NEIGHBORS) do
+                    local next_key = nav_key(cell.gx + offset[1], cell.gz + offset[2])
+                    local next_cell = memory.road_cells[next_key]
+                    if parent[next_key] == nil and next_cell ~= nil and next_cell.road
+                        and (memory.road_blacklist[next_key] or 0) <= now then
+                        local edge_key = key < next_key and key .. ">" .. next_key
+                            or next_key .. ">" .. key
+                        local connected = memory.road_edges[edge_key]
+                        if connected == nil then
+                            connected = is_road_point(map, (cell.x + next_cell.x) / 2,
+                                (cell.z + next_cell.z) / 2)
+                            if connected then
+                                memory.road_edges[edge_key] = true
+                            end
+                        end
+                        if connected then
+                            parent[next_key] = key
+                            table.insert(queue, next_key)
+                        end
+                    end
+                end
+            end
+            if goal_key ~= nil then
+                local next_key = goal_key
+                while parent[next_key] ~= false and parent[next_key] ~= start.key do
+                    next_key = parent[next_key]
+                end
+                local cell = memory.road_cells[next_key]
+                local candidate =
+                {
+                    key = next_key,
+                    x = cell.x,
+                    z = cell.z,
+                }
+                local candidate_leg, candidate_status = make_navigation_leg(
+                    player, map, candidate, ROAD_ARRIVAL_DISTANCE)
+                if candidate_leg ~= nil then
+                    memory.road_target = candidate
+                    leg = candidate_leg
+                    status = "ready"
+                    break
+                elseif candidate_status == "blocked" then
+                    memory.road_blacklist[candidate.key] = now + NAV_BLACKLIST_SECONDS
+                end
+            end
+        end
+    elseif leg ~= nil then
+        status = "ready"
+    end
+    target = memory.road_target
+    if target ~= nil then
+        target.distance = math.sqrt((target.x - px) * (target.x - px) + (target.z - pz) * (target.z - pz))
+    end
+    return target, leg, status
 end
 
 local function make_state(player)
@@ -565,7 +921,7 @@ local function make_state(player)
 
     return
     {
-        schema = 6,
+        schema = 7,
         observed_at = round(G.GetTime(), 3),
         player =
         {
@@ -587,6 +943,7 @@ local function make_state(player)
             is_night = world.isnight == true,
         },
         camera = camera,
+        work = player._jev_dst_work,
         navigation = read_navigation(player),
         crafting = read_crafting(player),
         nearby = read_nearby(player),
@@ -645,6 +1002,25 @@ local function reject_current_frontier()
     memory.blacklist[key] = G.GetTime() + NAV_BLACKLIST_SECONDS
     memory.target = nil
     print("[JEV_DST_ACTION]reject_frontier:blacklisted key=" .. tostring(key))
+    emit_state(player)
+end
+
+local function reject_current_road_target()
+    local player = G.ThePlayer
+    local world = G.TheWorld
+    if player == nil or not player:IsValid() or world == nil then
+        print("[JEV_DST_ACTION_ERROR]reject_road:world_or_player_unavailable")
+        return
+    end
+    local memory = get_navigation_memory(world)
+    if memory.road_target == nil then
+        print("[JEV_DST_ACTION]reject_road:no_target")
+        return
+    end
+    local key = memory.road_target.key
+    memory.road_blacklist[key] = G.GetTime() + NAV_BLACKLIST_SECONDS
+    memory.road_target = nil
+    print("[JEV_DST_ACTION]reject_road:blacklisted key=" .. tostring(key))
     emit_state(player)
 end
 
@@ -831,6 +1207,19 @@ local function perform_work_action(action, target_tag, tool_prefab)
         player._jev_dst_work_task = nil
     end
 
+    local tx, ty, tz = target.Transform:GetWorldPosition()
+    player._jev_dst_work_sequence = (player._jev_dst_work_sequence or 0) + 1
+    local work =
+    {
+        sequence = player._jev_dst_work_sequence,
+        action = string.lower(action.id),
+        target_guid = target.GUID,
+        x = round(tx, 2),
+        z = round(tz, 2),
+        status = "started",
+    }
+    player._jev_dst_work = work
+
     local attempts = 0
     local function schedule(delay, fn)
         player._jev_dst_work_task = player:DoTaskInTime(delay, fn)
@@ -841,10 +1230,13 @@ local function perform_work_action(action, target_tag, tool_prefab)
             return
         end
         if not target:IsValid() or not target:HasTag(target_tag) then
+            work.status = "completed"
             print("[JEV_DST_ACTION]" .. string.lower(action.id) .. ":completed target=" .. tostring(target.GUID))
             return
         end
         if not tool:IsValid() then
+            work.status = "failed"
+            work.reason = "tool_broke_before_completion"
             print("[JEV_DST_ACTION_ERROR]" .. string.lower(action.id) .. ":tool_broke_before_completion")
             return
         end
@@ -871,6 +1263,8 @@ local function perform_work_action(action, target_tag, tool_prefab)
         controller:DoAction(buffaction)
         attempts = attempts + 1
         if attempts > required + 5 then
+            work.status = "failed"
+            work.reason = "completion_timeout"
             print("[JEV_DST_ACTION_ERROR]" .. string.lower(action.id) .. ":completion_timeout")
             return
         end
@@ -890,6 +1284,8 @@ end
 
 local SAFE_FOOD_PRIORITY =
 {
+    "cookedmeat",
+    "cookedsmallmeat",
     "berries_cooked",
     "carrot_cooked",
     "berries",
@@ -897,6 +1293,74 @@ local SAFE_FOOD_PRIORITY =
     "seeds_cooked",
     "seeds",
 }
+
+local COOKABLE_FOOD_PRIORITY =
+{
+    "meat",
+    "smallmeat",
+    "berries",
+    "carrot",
+}
+
+local function cook_one_food()
+    local player = G.ThePlayer
+    local inventory = player ~= nil and player.replica ~= nil and player.replica.inventory or nil
+    local controller = player ~= nil and player.components ~= nil and player.components.playercontroller or nil
+    if player == nil or not player:IsValid() or inventory == nil or controller == nil then
+        print("[JEV_DST_ACTION_ERROR]cook_food:player_or_controller_unavailable")
+        return
+    end
+    if safe_call(function() return controller:IsBusy() end, false) then
+        print("[JEV_DST_ACTION_ERROR]cook_food:controller_busy")
+        return
+    end
+
+    local food = nil
+    for _, prefab in ipairs(COOKABLE_FOOD_PRIORITY) do
+        food = inventory:FindItem(function(item)
+            return item ~= nil and item:IsValid() and item.prefab == prefab
+                and item:HasTag("cookable")
+        end)
+        if food ~= nil then
+            break
+        end
+    end
+    if food == nil then
+        print("[JEV_DST_ACTION_ERROR]cook_food:no_cookable_food")
+        return
+    end
+
+    local px, py, pz = player.Transform:GetWorldPosition()
+    local fires = G.TheSim:FindEntities(px, py, pz, 6, { "cooker" }, EXCLUDE_TAGS)
+    local fire, nearest_distance = nil, nil
+    for _, candidate in ipairs(fires) do
+        if candidate:IsValid() and (candidate.prefab == "campfire" or candidate.prefab == "firepit")
+            and candidate:HasTag("fire") and not candidate:HasTag("fueldepleted") then
+            local distance = player:GetDistanceSqToInst(candidate)
+            if fire == nil or distance < nearest_distance then
+                fire = candidate
+                nearest_distance = distance
+            end
+        end
+    end
+    if fire == nil then
+        print("[JEV_DST_ACTION_ERROR]cook_food:no_lit_cooker")
+        return
+    end
+
+    local action = safe_call(function() return controller:GetItemUseAction(food, fire) end, nil)
+    if action == nil or action.action ~= G.ACTIONS.COOK then
+        print("[JEV_DST_ACTION_ERROR]cook_food:native_action_unavailable")
+        return
+    end
+    if controller.ismastersim then
+        controller:DoAction(action)
+    else
+        controller:RemoteControllerUseItemOnSceneFromInvTile(action, food)
+    end
+    print("[JEV_DST_ACTION]cook_food:requested prefab=" .. tostring(food.prefab)
+        .. " fire=" .. tostring(fire.GUID))
+end
 
 local function eat_safe_food()
     local player = G.ThePlayer
@@ -1223,6 +1687,8 @@ G.TheInput:AddKeyUpHandler(G.KEY_F10, attack_nearest_hostile)
 G.TheInput:AddKeyUpHandler(G.KEY_F11, equip_best_weapon)
 G.TheInput:AddKeyUpHandler(G.KEY_F12, build_science_machine)
 G.TheInput:AddKeyUpHandler(G.KEY_F5, reject_current_frontier)
+G.TheInput:AddKeyUpHandler(G.KEY_F4, reject_current_road_target)
+G.TheInput:AddKeyUpHandler(G.KEY_F3, cook_one_food)
 
 -- ThePlayer is often still nil while player prefabs are being initialized on a
 -- joining client. Poll from the world instead of making a one-shot comparison.

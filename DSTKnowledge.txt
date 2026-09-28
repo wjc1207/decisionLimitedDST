@@ -32,11 +32,20 @@ Planning considerations:
   not guarantees of resources. Spawn and mixed areas are not single tile types.
   Oasis and ordinary desert share desert ground cues; do not infer an oasis
   without additional evidence. Prioritize resources actually observed nearby.
+- The observed area graph uses topology ID plus terrain as a local node key.
+  explore_adjacent_* enters a discovered neighboring node through a verified
+  passable gateway; return_previous_region backtracks through a recorded
+  connection. Resources_seen are observations, whereas terrain hints are only
+  priors. These actions advance one leg and may be interrupted for survival.
+  Roads help discover unknown nodes, but a road is not itself a node boundary.
 - Terrain is only a search hint: forest often has trees and saplings; grassland
   often has grass and saplings; savanna often has grass and may have beefalo;
   rocky ground often has rocks and flint; swamp can contain reeds and hostile
   creatures. World generation varies, so never assume an unseen resource is
   present or safe to reach. For a needed material, prefer a biome likely to
   contain it, then verify via the live nearby-entity observations.
+- PotentialThreat means a nearby hostile may attack on approach even while it
+  is not actively chasing. Avoid revisiting a recently observed enemy location
+  after fleeing; navigation remembers it briefly and filters unsafe legs.
 - Prefer feasible resource prerequisites and immediate survival over an invented
   objective. A planned recipe is not necessarily currently craftable.

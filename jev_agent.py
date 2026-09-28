@@ -323,6 +323,62 @@ def build_candidates(state: dict) -> Tuple[Dict[str, str], Dict[str, dict]]:
             "frontier_x": frontier_target.get("x"),
             "frontier_z": frontier_target.get("z"),
         }
+    graph = navigation.get("graph") or {}
+    biome_resource_hints = {
+        "forest": "trees and saplings",
+        "grassland": "grass and saplings",
+        "savanna": "grass; beefalo may be present",
+        "swamp": "reeds, with significant hostile risk",
+        "rocky": "rocks and flint; some rocks may yield gold",
+        "deciduous_forest": "deciduous trees and scattered food",
+        "desert": "desert resources, but do not assume an oasis",
+    }
+    for index, route in enumerate((graph.get("adjacent") or [])[:4], start=1):
+        if route.get("status") != "ready" or not route.get("target") or not route.get("leg"):
+            continue
+        if not controller.graph_route_available(str(route.get("node_id") or "")):
+            continue
+        destination = route.get("biome") or "unknown terrain"
+        observed = ", ".join(route.get("resources_seen") or []) or "none recorded"
+        hint = biome_resource_hints.get(destination, "no specific terrain prior")
+        action_id = f"explore_adjacent_{index}"
+        criteria[action_id] = (
+            f"Go to observed adjacent area {route['node_id']} ({destination}), "
+            f"about {float(route.get('distance', 0)):.1f} units to its boundary. "
+            f"Resources actually seen there: {observed}. Terrain-based possibilities, "
+            f"not observations: {hint}. Walk only the next verified leg, then reconsider."
+        )
+        dispatch[action_id] = {
+            "kind": "explore", "navigation_mode": "graph",
+            "target_node_id": route["node_id"],
+            "target_x": route["leg"]["x"], "target_z": route["leg"]["z"],
+            "leg_distance": route["leg"]["distance"],
+            "frontier_x": route["target"]["x"],
+            "frontier_z": route["target"]["z"],
+        }
+    return_route = graph.get("return_route") or {}
+    if (return_route.get("status") == "ready" and return_route.get("target")
+            and return_route.get("leg") and controller.graph_route_available(
+                str(return_route.get("node_id") or ""))):
+        destination = return_route.get("biome") or "unknown terrain"
+        observed = ", ".join(return_route.get("resources_seen") or []) or "none recorded"
+        criteria["return_previous_region"] = (
+            f"Return along a recorded connection to previously visited area "
+            f"{return_route['node_id']} ({destination}); about "
+            f"{float(return_route.get('distance', 0)):.1f} units to its boundary. "
+            f"Resources previously observed there: {observed}. "
+            "Walk only the next verified leg, then reconsider."
+        )
+        dispatch["return_previous_region"] = {
+            "kind": "explore", "navigation_mode": "graph",
+            "target_node_id": return_route["node_id"],
+            "target_x": return_route["leg"]["x"],
+            "target_z": return_route["leg"]["z"],
+            "leg_distance": return_route["leg"]["distance"],
+            "frontier_x": return_route["target"]["x"],
+            "frontier_z": return_route["target"]["z"],
+        }
+
     road = navigation.get("road") or {}
     road_target = road.get("target") or {}
     road_leg = road.get("leg") or {}
@@ -439,8 +495,9 @@ def build_candidates(state: dict) -> Tuple[Dict[str, str], Dict[str, dict]]:
         target = min(pursuing_targets, key=lambda entity: float(entity.get("distance", 999)))
         threat_distance = float(target.get("distance", 999))
         criteria["flee_from_nearest_hostile"] = (
-            f"Move directly away from the nearest pursuing hostile ({target.get('prefab')}) at {threat_distance:.2f} units "
-            "in repeated escape legs until no active pursuer remains nearby or the bounded safety limit is reached. "
+            f"Escape the nearest pursuing hostile ({target.get('prefab')}) at {threat_distance:.2f} units "
+            "using passable directions that increase separation, including a sideways route when the direct "
+            "away direction is blocked. Recheck after each leg; stop when pursuit clears or at the safety limit. "
             "Strongly prefer when unarmed, badly hurt, or fighting is unnecessary."
         )
         dispatch["flee_from_nearest_hostile"] = {
@@ -527,6 +584,9 @@ def build_candidates(state: dict) -> Tuple[Dict[str, str], Dict[str, dict]]:
     criteria = {
         k: v for k, v in criteria.items()
         if action_allowed(state, dispatch[k]["kind"])[0]
+        and (dispatch[k]["kind"] != "explore" or controller.exploration_hazard_on_leg(
+            state, float(dispatch[k]["target_x"]), float(dispatch[k]["target_z"]),
+        ) is None)
     }
     dispatch = {k: v for k, v in dispatch.items() if k in criteria}
     return criteria, dispatch
@@ -555,6 +615,7 @@ def compact_game_state(state: dict, daily_plan: Optional[dict] = None) -> dict:
             "chop_nearest_tree and mine_nearest_rock include bounded pickup of nearby work drops, including secondary materials. Collect leftovers separately only when useful items remain visible.",
             "At night near a lit fire, unequip a torch to save fuel only if staying near that fire; keep it equipped when moving away.",
             "Prefer a useful safe action over repeated waiting, but do not take unnecessary risks for optional resources.",
+            "A nearby potentialThreat may attack on approach even when activeThreat is false; avoid routes through remembered hazards.",
             "A daily_plan is strategic advice from a separate planner, not a command. Make the fastest safe next-action choice from current facts; do not generate or revise a plan.",
         ],
         "day": world.get("day"),
@@ -594,6 +655,7 @@ def compact_game_state(state: dict, daily_plan: Optional[dict] = None) -> dict:
                 "work_required": entity.get("work_required"),
                 "attackable": entity.get("attackable", False),
                 "activeThreat": entity.get("activeThreat", False),
+                "potentialThreat": entity.get("potentialThreat", False),
             }
             for entity in state.get("nearby", [])
         ],
@@ -673,6 +735,7 @@ def execute_action(action: dict, log_path: Path, move_seconds: float = 1.0) -> b
             frontier_x=float(action["frontier_x"]),
             frontier_z=float(action["frontier_z"]),
             navigation_mode=action.get("navigation_mode", "region"),
+            target_node_id=action.get("target_node_id"),
         )
     elif kind == "wait":
         time.sleep(1.0)
@@ -713,7 +776,8 @@ def default_execution_threshold(choice: str, state: Optional[dict] = None) -> fl
     """Apply the shared gate, with only urgent and riskier actions excepted."""
     if choice in {"flee_from_nearest_hostile", "wait"}:
         return 0.0
-    if choice in {"explore", "explore_current_region", "explore_other_region"}:
+    if choice in {"explore", "explore_current_region", "explore_other_region",
+                  "return_previous_region"} or choice.startswith("explore_adjacent_"):
         return 0.15
     if choice == "attack_nearest_hostile":
         return 0.45

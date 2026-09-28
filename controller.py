@@ -45,8 +45,15 @@ VK = {
 }
 MOVEMENT_KEYS = (VK["up"], VK["left"], VK["down"], VK["right"])
 EXPLORATION_STALL = {"target": None, "count": 0, "last_position": None}
+GRAPH_ROUTE_BLACKLIST: Dict[str, float] = {}
 REGION_ARRIVAL_DISTANCE = 1.5
 ROAD_ARRIVAL_DISTANCE = 1.25
+EXPLORATION_HAZARD_CLEARANCE = 14.0
+EXPLORATION_HAZARD_CAUTION = 20.0
+
+
+def graph_route_available(node_id: str) -> bool:
+    return time.monotonic() >= GRAPH_ROUTE_BLACKLIST.get(node_id, 0.0)
 
 INPUT_KEYBOARD = 1
 KEYEVENTF_KEYUP = 0x0002
@@ -353,6 +360,91 @@ def nearest_hostile(state: dict, maximum_distance: float = 8.0) -> Optional[dict
     )
 
 
+def exploration_hazard_on_leg(
+    state: dict, target_x: float, target_z: float,
+) -> Optional[dict]:
+    """Reject an exploration leg that crosses or approaches a known hostile."""
+    position = state.get("player", {}).get("position", {})
+    if position.get("x") is None or position.get("z") is None:
+        return None
+    px, pz = float(position["x"]), float(position["z"])
+    dx, dz = target_x - px, target_z - pz
+    length_sq = dx * dx + dz * dz
+    hazards: dict[object, dict] = {}
+    for hazard in state.get("navigation", {}).get("hazards", []):
+        if hazard.get("x") is not None and hazard.get("z") is not None:
+            hazards[hazard.get("guid") or (hazard["x"], hazard["z"])] = hazard
+    for entity in state.get("nearby", []):
+        if entity.get("potentialThreat") is True or entity.get("activeThreat") is True:
+            if entity.get("dx") is not None and entity.get("dz") is not None:
+                hazards[entity.get("guid") or (entity["dx"], entity["dz"])] = {
+                    "guid": entity.get("guid"), "prefab": entity.get("prefab"),
+                    "x": px + float(entity["dx"]), "z": pz + float(entity["dz"]),
+                }
+    for hazard in hazards.values():
+        hx, hz = float(hazard["x"]), float(hazard["z"])
+        start_distance = math.hypot(px - hx, pz - hz)
+        end_distance = math.hypot(target_x - hx, target_z - hz)
+        projection = 0.0 if length_sq == 0 else max(0.0, min(
+            1.0, ((hx - px) * dx + (hz - pz) * dz) / length_sq,
+        ))
+        path_distance = math.hypot(px + projection * dx - hx, pz + projection * dz - hz)
+        moving_away = (
+            start_distance < EXPLORATION_HAZARD_CLEARANCE
+            and end_distance > start_distance + 0.5
+            and path_distance >= start_distance - 0.5
+        )
+        if not moving_away and (
+            path_distance < EXPLORATION_HAZARD_CLEARANCE
+            or (end_distance < EXPLORATION_HAZARD_CAUTION
+                and end_distance < start_distance - 0.5)
+        ):
+            return hazard
+    return None
+
+
+def choose_escape_route(
+    state: dict, blocked_keys: set[tuple[int, ...]] | None = None,
+) -> tuple[dict, List[int], float] | None:
+    """Choose a passable escape ray that maximizes separation from pursuers."""
+    blocked_keys = blocked_keys or set()
+    threats = [
+        entity for entity in state.get("nearby", [])
+        if entity.get("activeThreat") is True
+        and float(entity.get("distance", math.inf)) <= 12.0
+    ]
+    if not threats:
+        return None
+    routes = state.get("navigation", {}).get("escape_routes")
+    if routes is None:
+        raise RuntimeError("Escape routes missing from telemetry; install and enable Mod v1.4.1 or newer")
+    best = None
+    best_score = -math.inf
+    current_separation = min(float(threat.get("distance", math.inf)) for threat in threats)
+    for route in routes:
+        distance = float(route.get("distance") or 0)
+        dx, dz = float(route.get("dx") or 0), float(route.get("dz") or 0)
+        norm = math.hypot(dx, dz)
+        if distance < 1.5 or norm < 0.5:
+            continue
+        dx, dz = dx / norm, dz / norm
+        keys = movement_keys_for_delta(state, dx, dz)
+        if not keys or tuple(keys) in blocked_keys:
+            continue
+        travel = min(distance, 5.0)
+        separation = min(
+            math.hypot(float(threat["dx"]) - dx * travel,
+                       float(threat["dz"]) - dz * travel)
+            for threat in threats
+        )
+        gain = separation - current_separation
+        score = separation + 0.25 * gain + 0.04 * distance
+        if score > best_score:
+            best = (route, keys, gain)
+            best_score = score
+    return best
+
+
 def has_nearby_lit_fire(state: dict, maximum_distance: float = 8.0) -> bool:
     return any(
         entity.get("prefab") in {"campfire", "firepit"}
@@ -389,16 +481,26 @@ def explore_leg(
     frontier_x: Optional[float] = None,
     frontier_z: Optional[float] = None,
     navigation_mode: str = "region",
+    target_node_id: Optional[str] = None,
 ) -> bool:
     def section(observed: dict) -> dict:
         navigation = observed.get("navigation", {})
-        return navigation if navigation_mode == "region" else navigation.get("road") or {}
+        if navigation_mode == "region":
+            return navigation
+        if navigation_mode == "road":
+            return navigation.get("road") or {}
+        graph = navigation.get("graph") or {}
+        routes = [*(graph.get("adjacent") or []), graph.get("return_route") or {}]
+        for route in routes:
+            if route.get("node_id") == target_node_id:
+                return route
+        return {}
 
     state, log_position = latest_state(log_path)
     if night_travel_without_torch(state):
         print("explore leg skipped: night requires an equipped torch, even beside a lit fire")
         return False
-    if navigation_mode not in {"region", "road"}:
+    if navigation_mode not in {"region", "road", "graph"}:
         raise ValueError(f"Unknown navigation mode: {navigation_mode}")
     navigation = section(state)
     frontier = navigation.get("target") or {}
@@ -427,7 +529,7 @@ def explore_leg(
         raise RuntimeError("Telemetry has no player position for frontier exploration")
     start_x = float(position["x"])
     start_z = float(position["z"])
-    stall_key = (navigation_mode, *frontier_key)
+    stall_key = (navigation_mode, target_node_id, *frontier_key)
     if EXPLORATION_STALL["target"] != stall_key:
         EXPLORATION_STALL.update(target=stall_key, count=0, last_position=None)
     previous_position = EXPLORATION_STALL["last_position"]
@@ -442,6 +544,10 @@ def explore_leg(
     if remaining <= arrival_distance:
         print("explore leg skipped: leg target is within arrival tolerance")
         return False
+    hazard = exploration_hazard_on_leg(state, target_x, target_z)
+    if hazard is not None:
+        print(f"explore leg skipped: route approaches {hazard.get('prefab')} guid={hazard.get('guid')}")
+        return False
     hwnd = find_game_window()
     focus_game(hwnd)
     fresh = state
@@ -454,6 +560,10 @@ def explore_leg(
         if night_travel_without_torch(fresh):
             light_lost = True
             break
+        hazard = exploration_hazard_on_leg(fresh, target_x, target_z)
+        if hazard is not None:
+            print(f"explore leg stopped: route approaches {hazard.get('prefab')} guid={hazard.get('guid')}")
+            return total_duration > 0
         current_position = fresh.get("player", {}).get("position", {})
         dx = target_x - float(current_position["x"])
         dz = target_z - float(current_position["z"])
@@ -518,6 +628,11 @@ def explore_leg(
             round(float(current_target.get("z", math.inf)), 2),
         )
         if EXPLORATION_STALL["count"] >= 2 and current_key == frontier_key:
+            if navigation_mode == "graph":
+                GRAPH_ROUTE_BLACKLIST[target_node_id or ""] = time.monotonic() + 30.0
+                print(f"graph route to {target_node_id} paused for 30s after two stalled legs")
+                EXPLORATION_STALL.update(target=None, count=0, last_position=None)
+                return True
             tap([VK["reject_road" if navigation_mode == "road" else "reject_frontier"]], 0.08)
             wait_for_state_condition(
                 log_path,
@@ -555,6 +670,7 @@ def follow_road(
     initial, _ = latest_state(log_path)
     initial_region = initial.get("navigation", {}).get("current_region")
     initial_biome = initial.get("navigation", {}).get("current_biome")
+    initial_node = (initial.get("navigation", {}).get("graph") or {}).get("current_node")
     initial_phase = initial.get("world", {}).get("phase")
     seen_collectibles = {
         entity.get("guid") for entity in initial.get("nearby", [])
@@ -577,7 +693,11 @@ def follow_road(
             break
         navigation = current.get("navigation", {})
         biome = navigation.get("current_biome")
-        if initial_biome is not None and biome is not None:
+        node = (navigation.get("graph") or {}).get("current_node")
+        if initial_node is not None and node is not None:
+            if node != initial_node:
+                break
+        elif initial_biome is not None and biome is not None:
             if biome != initial_biome:
                 break
         elif initial_region is not None and navigation.get("current_region") != initial_region:
@@ -700,6 +820,7 @@ def flee_from_hostile(
     focus_game(hwnd)
     bursts = 0
     clear_count = 0
+    blocked_keys: set[tuple[int, ...]] = set()
     try:
         while bursts < max_bursts:
             target = None
@@ -726,16 +847,29 @@ def flee_from_hostile(
                 continue
 
             clear_count = 0
-            keys = movement_keys_for_delta(state, -float(target["dx"]), -float(target["dz"]))
-            if not keys:
-                raise RuntimeError("Cannot derive a safe flee direction from telemetry")
-            tap(keys, duration)
+            selected = choose_escape_route(state, blocked_keys)
+            if selected is None:
+                raise RuntimeError("No passable, unblocked escape direction; stopped instead of running into the boundary")
+            route, keys, predicted_gain = selected
+            safe_distance = float(route["distance"])
+            pulse = min(duration, max(0.18, (safe_distance - 0.5) / 5.0))
+            before = state.get("player", {}).get("position", {})
+            tap(keys, pulse)
             bursts += 1
             print(
                 f"flee burst={bursts}/{max_bursts} hostile={target.get('prefab')} "
-                f"guid={target.get('guid')} distance={float(target.get('distance', 0)):.2f}"
+                f"guid={target.get('guid')} distance={float(target.get('distance', 0)):.2f} "
+                f"safe_path={safe_distance:.2f} predicted_gain={predicted_gain:.2f}"
             )
             state, log_position = wait_for_fresh_state(log_path, log_position)
+            after = state.get("player", {}).get("position", {})
+            progress = math.hypot(
+                float(after.get("x", 0)) - float(before.get("x", 0)),
+                float(after.get("z", 0)) - float(before.get("z", 0)),
+            )
+            if progress < 0.3:
+                blocked_keys.add(tuple(keys))
+                print(f"flee direction blocked: keys={keys} progress={progress:.2f}; rerouting")
     finally:
         release_movement_keys()
     remaining = nearest_hostile(state, maximum_distance=12.0)

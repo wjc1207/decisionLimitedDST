@@ -283,6 +283,24 @@ class CandidateTests(unittest.TestCase):
         self.assertNotIn("explore_current_region", criteria)
         self.assertNotIn("explore_other_region", criteria)
 
+    def test_potential_threat_hides_exploration_toward_it(self) -> None:
+        observed = state([{
+            "guid": 30, "prefab": "knight", "distance": 12.0,
+            "dx": 0.0, "dz": 12.0, "activeThreat": False,
+            "potentialThreat": True, "tags": ["hostile", "monster"],
+        }])
+        criteria, _ = jev_agent.build_candidates(observed)
+        self.assertNotIn("explore_current_region", criteria)
+        self.assertIn("wait", criteria)
+
+    def test_remembered_hazard_blocks_return_leg_but_allows_away_leg(self) -> None:
+        observed = state([])
+        observed["navigation"]["hazards"] = [
+            {"guid": 30, "prefab": "knight", "x": 0.0, "z": 12.0, "age": 3.0}
+        ]
+        self.assertIsNotNone(controller.exploration_hazard_on_leg(observed, 0.0, 4.0))
+        self.assertIsNone(controller.exploration_hazard_on_leg(observed, 0.0, -4.0))
+
     def test_night_campfire_requires_torch_for_travel_and_collection(self) -> None:
         observed = state([lit_campfire(), grass(10, 4.0, True)])
         observed["world"]["phase"] = "night"
@@ -355,6 +373,54 @@ class CandidateTests(unittest.TestCase):
         criteria, _ = jev_agent.build_candidates(observed)
 
         self.assertNotIn("explore_other_region", criteria)
+
+    def test_area_graph_exposes_neighbor_and_recorded_return(self) -> None:
+        observed = state([])
+        observed["navigation"]["graph"] = {
+            "current_node": "A|forest",
+            "adjacent": [{
+                "status": "ready", "node_id": "B|rocky", "biome": "rocky",
+                "distance": 6.0, "entered": False,
+                "resources_seen": ["rock1"],
+                "target": {"x": 8.0, "z": 0.0},
+                "leg": {"x": 4.0, "z": 0.0, "distance": 4.0},
+            }],
+            "return_route": {
+                "status": "ready", "node_id": "C|grassland",
+                "biome": "grassland", "distance": 5.0,
+                "resources_seen": ["grass"],
+                "target": {"x": -8.0, "z": 0.0},
+                "leg": {"x": -4.0, "z": 0.0, "distance": 4.0},
+            },
+        }
+        criteria, dispatch = jev_agent.build_candidates(observed)
+
+        self.assertIn("explore_adjacent_1", criteria)
+        self.assertIn("rock1", criteria["explore_adjacent_1"])
+        self.assertIn("may yield gold", criteria["explore_adjacent_1"])
+        self.assertEqual(dispatch["explore_adjacent_1"]["target_node_id"], "B|rocky")
+        self.assertIn("return_previous_region", criteria)
+        self.assertEqual(dispatch["return_previous_region"]["target_node_id"], "C|grassland")
+        self.assertEqual(jev_agent.default_execution_threshold("explore_adjacent_1"), 0.15)
+        self.assertEqual(jev_agent.default_execution_threshold("return_previous_region"), 0.15)
+
+    def test_graph_choice_dispatches_one_verified_leg(self) -> None:
+        observed = state([])
+        observed["navigation"]["graph"] = {
+            "adjacent": [{
+                "status": "ready", "node_id": "B|rocky", "biome": "rocky",
+                "distance": 6.0, "target": {"x": 8.0, "z": 0.0},
+                "leg": {"x": 4.0, "z": 0.0, "distance": 4.0},
+            }],
+        }
+        _, dispatch = jev_agent.build_candidates(observed)
+        with patch.object(controller, "explore_leg", return_value=True) as leg:
+            moved = jev_agent.execute_action(
+                dispatch["explore_adjacent_1"], Path("unused.log"), move_seconds=1.2,
+            )
+        self.assertTrue(moved)
+        self.assertEqual(leg.call_args.kwargs["navigation_mode"], "graph")
+        self.assertEqual(leg.call_args.kwargs["target_node_id"], "B|rocky")
 
     def test_day_and_dusk_torch_options_depend_on_equipment(self) -> None:
         for phase in ("day", "dusk"):
@@ -898,6 +964,34 @@ class ControllerTests(unittest.TestCase):
         self.assertTrue(moved)
         self.assertEqual(leg.call_count, 2)
 
+    def test_follow_road_stops_on_new_graph_node_with_same_biome(self) -> None:
+        def road_state(position: float, node: str) -> dict:
+            observed = state([])
+            observed["player"]["position"]["x"] = position
+            observed["navigation"].update({
+                "current_biome": "forest",
+                "graph": {"current_node": node},
+                "road": {
+                    "status": "ready",
+                    "target": {"x": position + 2.0, "z": 0.0},
+                    "leg": {"x": position + 2.0, "z": 0.0, "distance": 2.0},
+                },
+            })
+            return observed
+
+        first = road_state(0.0, "A|forest")
+        second = road_state(2.0, "B|forest")
+        with (
+            patch.object(controller, "latest_state", side_effect=[
+                (first, 100), (first, 100), (second, 101), (second, 101),
+            ]),
+            patch.object(controller, "explore_leg", return_value=True) as leg,
+        ):
+            moved = controller.follow_road(Path("unused.log"), 2.0, 0.0, 2.0)
+
+        self.assertTrue(moved)
+        self.assertEqual(leg.call_count, 1)
+
     def test_exploration_prompt_uses_biome(self) -> None:
         observed = state([])
         observed["navigation"]["current_biome"] = "rocky"
@@ -939,6 +1033,22 @@ class ControllerTests(unittest.TestCase):
 
         self.assertFalse(moved)
         tap.assert_not_called()
+
+    def test_explore_rechecks_remembered_hazard_before_keypress(self) -> None:
+        observed = state([])
+        observed["navigation"]["hazards"] = [
+            {"guid": 30, "prefab": "knight", "x": 0.0, "z": 12.0, "age": 3.0}
+        ]
+        tap = Mock()
+        with (
+            patch.object(controller, "latest_state", return_value=(observed, 100)),
+            patch.object(controller, "tap", tap),
+            patch.object(controller, "find_game_window") as find_window,
+        ):
+            moved = controller.explore_leg(Path("unused.log"), 0.0, 4.0, 4.0)
+        self.assertFalse(moved)
+        tap.assert_not_called()
+        find_window.assert_not_called()
 
     def test_road_exploration_stops_when_night_falls_without_torch(self) -> None:
         before = state([lit_campfire()])
@@ -1082,6 +1192,35 @@ class ControllerTests(unittest.TestCase):
         tap.assert_called_once_with([controller.VK["up"]], 1.0)
         release.assert_called_once_with()
 
+    def test_graph_route_walks_only_its_live_next_leg(self) -> None:
+        before = state([])
+        before["navigation"]["graph"] = {
+            "adjacent": [{
+                "status": "ready", "node_id": "B|rocky",
+                "target": {"x": 8.0, "z": 0.0},
+                "leg": {"x": 4.0, "z": 0.0, "distance": 4.0},
+            }],
+        }
+        after = json.loads(json.dumps(before))
+        after["player"]["position"]["x"] = 3.5
+        tap = Mock()
+        controller.EXPLORATION_STALL.update(target=None, count=0, last_position=None)
+        with (
+            patch.object(controller, "latest_state", return_value=(before, 100)),
+            patch.object(controller, "find_game_window", return_value=123),
+            patch.object(controller, "focus_game"),
+            patch.object(controller, "wait_for_fresh_state", return_value=(after, 101)),
+            patch.object(controller, "tap", tap),
+            patch.object(controller, "release_movement_keys"),
+        ):
+            moved = controller.explore_leg(
+                Path("unused.log"), 4.0, 0.0, 4.0,
+                frontier_x=8.0, frontier_z=0.0,
+                navigation_mode="graph", target_node_id="B|rocky",
+            )
+        self.assertTrue(moved)
+        tap.assert_called_once_with([controller.VK["right"]], 1.0)
+
     def test_region_leg_within_arrival_tolerance_does_not_micro_correct(self) -> None:
         observed = state([])
         observed["navigation"]["leg"] = {
@@ -1182,7 +1321,11 @@ class ControllerTests(unittest.TestCase):
 
     def test_flee_moves_directly_away_from_hostile(self) -> None:
         observed = state([hostile(30, 3.0)])
+        observed["navigation"]["escape_routes"] = [
+            {"dx": -1.0, "dz": 0.0, "distance": 6.0}
+        ]
         safe = state([])
+        safe["player"]["position"]["x"] = -4.0
         tap = Mock()
         release = Mock()
 
@@ -1208,6 +1351,13 @@ class ControllerTests(unittest.TestCase):
         chasing_1 = state([hostile(30, 5.0)])
         chasing_2 = state([hostile(30, 9.0)])
         safe = state([])
+        for snapshot in (observed, chasing_1, chasing_2):
+            snapshot["navigation"]["escape_routes"] = [
+                {"dx": -1.0, "dz": 0.0, "distance": 6.0}
+            ]
+        chasing_1["player"]["position"]["x"] = -4.0
+        chasing_2["player"]["position"]["x"] = -8.0
+        safe["player"]["position"]["x"] = -12.0
         tap = Mock()
 
         with (
@@ -1233,6 +1383,56 @@ class ControllerTests(unittest.TestCase):
         tap.assert_has_calls(
             [call([controller.VK["left"]], 1.0)] * 3
         )
+
+    def test_flee_chooses_tangent_when_away_direction_is_impassable(self) -> None:
+        observed = state([hostile(30, 3.0)])
+        observed["navigation"]["escape_routes"] = [
+            {"dx": 0.0, "dz": 1.0, "distance": 6.0},
+            {"dx": 0.0, "dz": -1.0, "distance": 6.0},
+        ]
+        route, keys, gain = controller.choose_escape_route(observed)
+        self.assertNotIn(controller.VK["left"], keys)
+        self.assertGreater(gain, 0)
+
+    def test_flee_replans_after_no_position_progress(self) -> None:
+        observed = state([hostile(30, 3.0)])
+        observed["navigation"]["escape_routes"] = [
+            {"dx": -1.0, "dz": 0.0, "distance": 6.0},
+            {"dx": 0.0, "dz": 1.0, "distance": 6.0},
+        ]
+        blocked = json.loads(json.dumps(observed))
+        safe = state([])
+        safe["player"]["position"]["z"] = 4.0
+        tap = Mock()
+        with (
+            patch.object(controller, "latest_state", return_value=(observed, 100)),
+            patch.object(controller, "find_game_window", return_value=123),
+            patch.object(controller, "focus_game"),
+            patch.object(controller, "wait_for_fresh_state", side_effect=[
+                (blocked, 101), (safe, 102), (safe, 103),
+            ]),
+            patch.object(controller, "tap", tap),
+            patch.object(controller, "release_movement_keys"),
+        ):
+            controller.flee_from_hostile(Path("unused.log"), preferred_guid=30)
+        self.assertEqual(tap.call_count, 2)
+        self.assertEqual(tap.call_args_list[0].args[0], [controller.VK["left"]])
+        self.assertEqual(tap.call_args_list[1].args[0], [controller.VK["up"]])
+
+    def test_flee_stops_when_no_passable_route_exists(self) -> None:
+        observed = state([hostile(30, 3.0)])
+        observed["navigation"]["escape_routes"] = []
+        tap = Mock()
+        with (
+            patch.object(controller, "latest_state", return_value=(observed, 100)),
+            patch.object(controller, "find_game_window", return_value=123),
+            patch.object(controller, "focus_game"),
+            patch.object(controller, "tap", tap),
+            patch.object(controller, "release_movement_keys"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "No passable"):
+                controller.flee_from_hostile(Path("unused.log"))
+        tap.assert_not_called()
 
     def test_depleted_preferred_guid_falls_back_to_live_grass(self) -> None:
         observed = state([grass(10, 0.4, False), grass(20, 0.8, True)])
